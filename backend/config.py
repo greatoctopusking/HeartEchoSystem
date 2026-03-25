@@ -2,7 +2,7 @@ import os
 
 MYSQL_HOST = "localhost"
 MYSQL_USER = "root"
-MYSQL_PASSWORD = "123456"
+MYSQL_PASSWORD = "556904452"
 MYSQL_DB = "heart_echo"
 
 UPLOAD_FOLDER = "uploads"
