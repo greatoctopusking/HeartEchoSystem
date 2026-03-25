@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
 sys.stdout.reconfigure(encoding='utf-8')
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backend'))
 
 from config import *
 from model_infer import run_inference
@@ -18,7 +19,7 @@ from biplane_simpson_clinical import BiplaneSimpsonClinical
 
 
 BASE_PATH = r"D:\SRTP_Project__DeepLearning\project\Resources\database_nifti"
-OUTPUT_DIR = r"D:\SRTP_Project__DeepLearning\HeartEchoSystem10\HeartEchoSystem\backend\debug_simpson_output"
+OUTPUT_DIR = r"D:\GithubRepositories\HeartEchoSystem\debug\debug_simpson_output"
 
 PATIENTS = ["patient0002", "patient0003", "patient0004"]
 

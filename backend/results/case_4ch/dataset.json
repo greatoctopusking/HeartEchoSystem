@@ -1,0 +1,15 @@
+{
+    "channel_names": {
+        "0": "H"
+    },
+    "labels": {
+        "background": 0,
+        "LV": 1,
+        "LVWall": 2,
+        "LA": 3
+    },
+    "numTraining": 900,
+    "file_ending": ".nii.gz",
+    "licence": "Whoever converted this dataset was lazy and didn't look it up!",
+    "converted_by": "Please enter your name, especially when sharing datasets with others in a common infrastructure!"
+}
