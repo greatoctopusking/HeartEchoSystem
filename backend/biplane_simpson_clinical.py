@@ -91,9 +91,9 @@ class BiplaneSimpsonClinical:
         return arr.astype(int).tolist()
 
 
+    """
     def _find_ed_es_robust(self, area_px, view_name=""):
         area_px = np.asarray(area_px, dtype=float)
-
         n = len(area_px)
 
         if n == 0:
@@ -102,34 +102,192 @@ class BiplaneSimpsonClinical:
         if n <= 4:
             return int(np.argmax(area_px)), int(np.argmin(area_px))
 
+        # =========================
+        # ESV：保持旧逻辑
+        # =========================
         med = np.median(area_px)
-
         mad = np.median(np.abs(area_px - med))
 
         if mad < 1e-6:
-            return int(np.argmax(area_px)), int(np.argmin(area_px))
+            es_i = int(np.argmin(area_px))
+        else:
+            robust_z = 0.6745 * (area_px - med) / mad
+            valid = np.abs(robust_z) <= 3.5
 
-        robust_z = 0.6745 * (area_px - med) / mad
+            if np.sum(valid) < max(3, n // 2):
+                es_i = int(np.argmin(area_px))
+            else:
+                valid_idx = np.where(valid)[0]
+                valid_vals = area_px[valid]
+                es_i = int(valid_idx[np.argmin(valid_vals)])
 
-        valid = np.abs(robust_z) <= 3.5
+                dropped_idx = np.where(~valid)[0].tolist()
+                if dropped_idx:
+                    print(f"[INFO] {view_name} 异常面积帧已剔除: {dropped_idx}")
+    """
+    
+    def _find_ed_es_robust(self, area_px, view_name=""):
+        area_px = np.asarray(area_px, dtype=float)
+        n = len(area_px)
+        if n == 0:
+            return -1, -1
 
-        if np.sum(valid) < max(3, n // 2):
-            return int(np.argmax(area_px)), int(np.argmin(area_px))
+        if n <= 4:
+            # 修改：序列极短时，也抛弃绝对最小值，取次小值作为 ESV
+            es_i = int(np.argsort(area_px)[1]) if n >= 2 else int(np.argmin(area_px))
+            return int(np.argmax(area_px)), es_i
 
-        valid_idx = np.where(valid)[0]
+        # =========================
+        # ESV：剔除绝对最小值，取次小值
+        # =========================
+        med = np.median(area_px)
+        mad = np.median(np.abs(area_px - med))
+        
+        if mad < 1e-6:
+            # 修改：抛弃绝对最小值
+            es_i = int(np.argsort(area_px)[1]) if n >= 2 else int(np.argmin(area_px))
+        else:
+            robust_z = 0.6745 * (area_px - med) / mad
+            valid = np.abs(robust_z) <= 3.5
+            if np.sum(valid) < max(3, n // 2):
+                # 修改：抛弃绝对最小值
+                es_i = int(np.argsort(area_px)[1]) if n >= 2 else int(np.argmin(area_px))
+            else:
+                valid_idx = np.where(valid)[0]
+                valid_vals = area_px[valid]
+                # 核心修改：在有效帧里，如果有两帧以上，对面积排序后取次小值（索引为1）
+                if len(valid_vals) >= 2:
+                    es_i = int(valid_idx[np.argsort(valid_vals)[1]])
+                else:
+                    es_i = int(valid_idx[np.argmin(valid_vals)])
+                
+                dropped_idx = np.where(~valid)[0].tolist()
+                if dropped_idx:
+                    print(f"[INFO] {view_name} 异常面积帧已剔除: {dropped_idx}")
 
-        valid_vals = area_px[valid]
+        # =========================
+        # EDV：新逻辑
+        # =========================
+        diffs = np.abs(np.diff(area_px))
+        diffs_list = diffs.astype(int)
+        diffs_with_idx = [f"{i}->{i+1}:{v}" for i, v in enumerate(diffs_list)]
+        print(f"[INFO] {view_name} 相邻帧像素差: {diffs_with_idx}")
 
-        ed_i = int(valid_idx[np.argmax(valid_vals)])
+        if diffs.size == 0:
+            ed_i = int(np.argmax(area_px))
+            return ed_i, es_i
 
-        es_i = int(valid_idx[np.argmin(valid_vals)])
+        # 阈值：更敏感一些
+        d_med = np.median(diffs)
+        d_mad = np.median(np.abs(diffs - d_med))
 
-        dropped_idx = np.where(~valid)[0].tolist()
+        if d_mad < 1e-6:
+            thr = float(d_med)
+        else:
+            thr = float(d_med + 1.5 * 1.4826 * d_mad)
 
-        if dropped_idx:
-            print(f"[INFO] {view_name} 异常面积帧已剔除: {dropped_idx}")
+        # 兜底，避免阈值过小把正常缓变切得过碎
+        thr = max(thr, float(np.percentile(diffs, 50)))
+
+        print(f"[INFO] {view_name} ED 阈值: {thr:.2f}")
+
+        stable = diffs < thr
+        print(f"[INFO] {view_name} 连续小变化标记: {stable.astype(int).tolist()}")
+
+        # =========================
+        # 根据突变切分序列
+        # 若 i->i+1 为突变，则旧序列到 i 结束，新序列从 i+1 开始
+        # =========================
+        runs = []
+        start = 0
+
+        for i, ok in enumerate(stable):
+            if not ok:
+                runs.append((start, i))
+                start = i + 1
+
+        # 最后一段
+        runs.append((start, len(area_px) - 1))
+
+        if not runs:
+            ed_i = int(np.argmax(area_px))
+            print(f"[INFO] {view_name} 未找到稳定序列，ED 回退为最大面积帧: {ed_i}")
+            return ed_i, es_i
+
+        # 打印所有序列
+        print(f"[INFO] {view_name} ===== 所有稳定序列 =====")
+        for idx, (s, e) in enumerate(runs, start=1):
+            seq_vals = area_px[s:e + 1].astype(int).tolist()
+            seq_str = ",".join(map(str, seq_vals))
+            print(f"[INFO] {view_name} 序列{idx}（帧{s}始，帧{e}终）：{seq_str}")
+
+        # 按长度排序，取前4长
+        runs = sorted(runs, key=lambda x: (x[1] - x[0] + 1), reverse=True)
+
+        def pick_ed_from_run(run):
+            s, e = run
+            idx_local = int(np.argmax(area_px[s:e + 1]))
+            return s + idx_local
+
+        top_runs = runs[:4]
+
+        candidates = []
+        for k, run in enumerate(top_runs, start=1):
+            edv_idx = pick_ed_from_run(run)
+            run_len = run[1] - run[0] + 1
+            area_val = float(area_px[edv_idx])
+
+            candidates.append({
+                "idx": edv_idx,
+                "area": area_val,
+                "run": run,
+                "len": run_len
+            })
+
+            print(
+                f"[INFO] {view_name} 第{k}长稳定序列: {run}, "
+                f"长度={run_len}, edv{k}={edv_idx}, area={int(area_val)}"
+            )
+
+        # =========================
+        # 智能选 ED：
+        # 1) 若4个候选彼此接近 -> 取最大者，避免低估EDV
+        # 2) 若4个候选分散明显 -> 取第2小者，避免被异常大值带偏
+        # =========================
+        candidates_sorted = sorted(candidates, key=lambda x: x["area"])
+        cand_areas = np.array([c["area"] for c in candidates_sorted], dtype=float)
+
+        area_min = float(np.min(cand_areas))
+        area_max = float(np.max(cand_areas))
+        area_med = float(np.median(cand_areas))
+        rel_spread = (area_max - area_min) / max(area_med, 1e-6)
+
+        print(
+            f"[INFO] {view_name} ED候选面积(升序): "
+            f"{[int(x) for x in cand_areas.tolist()]}, 相对离散度={rel_spread:.3f}"
+        )
+
+        # 阈值可调：
+        # rel_spread <= 0.10 认为4个候选比较接近，直接取最大
+        # 否则取第2小，防止高估
+        if rel_spread <= 0.10:
+            best = candidates_sorted[-1]
+            strategy = "候选接近，取最大者"
+        else:
+            pick_rank = 1 if len(candidates_sorted) >= 2 else 0
+            best = candidates_sorted[pick_rank]
+            strategy = "候选分散，取第2小者"
+
+        ed_i = int(best["idx"])
+        print(
+            f"[INFO] {view_name} 最终 ED 策略: {strategy}; "
+            f"ED={ed_i}, area={int(best['area'])}"
+        )
 
         return ed_i, es_i
+        
+   
+
     # ═══════════════════════════════════════════════════════════════════════════
     #  公开接口 1：单帧体积
     # ═══════════════════════════════════════════════════════════════════════════
@@ -894,6 +1052,19 @@ class BiplaneSimpsonClinical:
         # if n <= 1: return m
         # counts = np.bincount(lab.ravel()); counts[0] = 0
         # return lab == int(np.argmax(counts))
+    def _keep_largest_component0(self, m):
+        if cc_label is None:   # 兜底（很重要）
+            return m
+
+        lab, n = cc_label(m.astype(np.uint8))
+        if n <= 1:
+            return m
+
+        sizes = np.bincount(lab.ravel())
+        sizes[0] = 0
+        largest = np.argmax(sizes)
+
+        return lab == largest
 
     def _pca_first_component(self, pts):
         X = pts - pts.mean(axis=0)

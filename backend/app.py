@@ -33,7 +33,7 @@ from biplane_simpson_clinical import BiplaneSimpsonClinical, ALGORITHM_LABELS
 
 # 视频处理
 import cv2
-
+from scipy.ndimage import label
 
 UPLOAD_FOLDER = "uploads"
 RESULT_FOLDER = "results"
@@ -144,6 +144,8 @@ def token_required(f):
             return jsonify({"error": "Invalid token"}), 401
         return f(*args, **kwargs)
     return decorated
+
+
 
 def _normalize_ultrasound_image(img: np.ndarray) -> np.ndarray:
     img = np.asarray(img, dtype=np.float32)
@@ -261,8 +263,87 @@ def _is_video(path: str) -> bool:
     ext = os.path.splitext(path.lower())[1]
     return ext in (".avi", ".mp4", ".mov")
 
-
 def video_to_nifti(path: str, out_path: str, max_frames: int = 80):
+    """
+    将视频转换为 NIfTI (H, W, T)。
+    修改版：提取全局统一裁剪框，保证物理空间无形变，确保后续容积/曲线计算精准。
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"视频文件不存在: {path}")
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise ValueError(f"无法打开视频文件: {path}")
+
+    raw_frames = []
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame is None:
+                continue
+
+            if frame.ndim == 2:
+                gray = frame
+            elif frame.ndim == 3:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            else:
+                continue
+            raw_frames.append(gray)
+    finally:
+        cap.release()
+
+    if not raw_frames:
+        raise ValueError("无法读取视频内容，未提取到有效帧")
+
+    # 1. 限帧采样：视频太长时均匀采样，减少计算量
+    total_frames = len(raw_frames)
+    if max_frames is not None and total_frames > max_frames:
+        sample_idx = np.linspace(0, total_frames - 1, max_frames).astype(int)
+        raw_frames = [raw_frames[i] for i in sample_idx]
+        print(f"[INFO] 视频原始帧数={total_frames}，已均匀采样到 {len(raw_frames)} 帧")
+    else:
+        print(f"[INFO] 视频帧数={total_frames}，无需采样")
+
+    # 2. 快速计算【全局统一裁剪框】
+    # 抽取 几帧做最大值投影，速度极快，且能确保囊括心动周期内所有可能的超声扇形亮区
+    #step = max(1, len(raw_frames) // 5)
+    step = max(1, len(raw_frames) // 10)
+    sample_for_box = np.max(np.stack(raw_frames[::step], axis=0), axis=0)
+
+    pad = 8
+    thr = max(5, int(np.percentile(sample_for_box, 60) * 0.15))
+    fg = sample_for_box > thr
+    if fg.sum() < sample_for_box.size * 0.01:
+        # 如果提取失败，使用全图
+        y0, y1, x0, x1 = 0, sample_for_box.shape[0], 0, sample_for_box.shape[1]
+    else:
+        ys, xs = np.where(fg)
+        y0, y1 = max(0, ys.min() - pad), min(sample_for_box.shape[0], ys.max() + pad + 1)
+        x0, x1 = max(0, xs.min() - pad), min(sample_for_box.shape[1], xs.max() + pad + 1)
+
+    # 3. 统一裁剪与归一化
+    frames = []
+    for gray in raw_frames:
+        # 所有帧使用同一个绝对坐标裁剪，保证画面无拉伸形变
+        cropped = gray[y0:y1, x0:x1]
+        normed = _normalize_ultrasound_image(cropped)
+        frames.append(normed.astype(np.float32))
+
+    # 组合为 NIfTI (由于尺寸严格一致，省去了原本耗时的 cv2.resize)
+    data = np.stack(frames, axis=-1)
+    spacing = (1.0, 1.0)
+    affine = np.diag([spacing[0], spacing[1], 1.0, 1.0])
+    img = nib.Nifti1Image(data, affine)
+    img.header.set_zooms((*spacing, 1.0))
+    nib.save(img, out_path)
+
+    return out_path, spacing
+
+
+
+def video_to_nifti0(path: str, out_path: str, max_frames: int = 80):
     """
     将视频转换为 NIfTI (H, W, T)。
     对普通视频文件默认 spacing=(1.0, 1.0)。
@@ -331,7 +412,7 @@ def video_to_nifti(path: str, out_path: str, max_frames: int = 80):
     return out_path, spacing
 
 
-def save_upload(fileobj, dest_dir: str, prefix: str = ""):
+def save_upload0(fileobj, dest_dir: str, prefix: str = ""):
     filename = secure_filename(fileobj.filename or "")
     if not filename:
         raise ValueError("上传文件名为空")
@@ -355,6 +436,30 @@ def save_upload(fileobj, dest_dir: str, prefix: str = ""):
         return nii_path, spacing
 
     return raw_path, None
+
+def save_upload(fileobj, dest_dir: str, prefix: str = ""):
+    filename = secure_filename(fileobj.filename or "")
+    if not filename:
+        raise ValueError("上传文件名为空")
+
+    lower_name = filename.lower()
+    if not any(lower_name.endswith(ext) for ext in SUPPORTED_EXT):
+        raise ValueError(f"不支持的文件类型: {filename}")
+
+    raw_path = os.path.join(dest_dir, prefix + filename)
+    fileobj.save(raw_path)
+
+    if _is_dicom(raw_path):
+        nii_path = raw_path + "_converted.nii.gz"
+        _, spacing = dicom_to_nifti(raw_path, nii_path)
+        return nii_path, spacing, False
+
+    if _is_video(raw_path):
+        nii_path = raw_path + "_converted.nii.gz"
+        _, spacing = video_to_nifti(raw_path, nii_path)
+        return nii_path, spacing, True
+
+    return raw_path, None, False
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -496,6 +601,75 @@ def draw_simpson_lines(
         )
 
 
+
+def _save_single_frame_overlay(
+    save_path,
+    view_name,
+    frame_i,
+    mask,
+    bg,
+    spacing,
+    axis_u_override=None,
+    apex_mm=None,
+    annulus_mid_mm=None,
+    n_discs=20,
+    band_frac=1.0,
+    min_band_points=3,
+):
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    fig.patch.set_facecolor('#111111')
+
+    if bg is not None:
+        ax.imshow(bg.T, cmap='gray', origin='lower')
+
+    int_mask = _ensure_int_labels(mask)
+
+    # 默认只显示 LV
+    lv_only = (int_mask == 1).astype(np.uint8)
+    ax.imshow(
+        np.ma.masked_where(lv_only.T == 0, lv_only.T),
+        cmap='Reds', alpha=0.50, origin='lower'
+    )
+
+    # =========================
+    # 可选：取消注释即可显示
+    # =========================
+    # lv_wall = (int_mask == 2).astype(np.uint8)
+    # ax.imshow(
+    #     np.ma.masked_where(lv_wall.T == 0, lv_wall.T),
+    #     cmap='Blues', alpha=0.35, origin='lower'
+    # )
+
+    # la_mask = (int_mask == 3).astype(np.uint8)
+    # ax.imshow(
+    #     np.ma.masked_where(la_mask.T == 0, la_mask.T),
+    #     cmap='Greens', alpha=0.35, origin='lower'
+    # )
+
+    draw_simpson_lines(
+        ax, mask, spacing,
+        n_discs=n_discs,
+        band_frac=band_frac,
+        min_band_points=min_band_points,
+        axis_u_override=axis_u_override,
+        apex_mm=apex_mm,
+        annulus_mid_mm=annulus_mid_mm,
+    )
+
+    ax.set_title(
+        f"{view_name} frame {frame_i}",
+        color='white', fontsize=12, fontweight='bold', pad=8
+    )
+    ax.axis('off')
+
+    fig.tight_layout(pad=1.0)
+    fig.savefig(
+        save_path,
+        bbox_inches='tight',
+        dpi=150,
+        facecolor=fig.get_facecolor()
+    )
+    plt.close(fig)
 # ──────────────────────────────────────────────────────────────────
 #  3D Mesh 生成
 # ──────────────────────────────────────────────────────────────────
@@ -587,7 +761,9 @@ def generate_ndjson_response(
     path2ch, path4ch, patient_data: dict,
     algorithm: str = "biplane_simpson",
     annulus_strategy: str = "auto",
-    spacing2_override=None, spacing4_override=None
+    spacing2_override=None, spacing4_override=None,
+    is_video_2ch: bool = False,
+    is_video_4ch: bool = False
 ):
     try:
         yield json.dumps({"progress": 5, "status": "文件已保存，读取影像数据..."}) + "\n"
@@ -717,7 +893,24 @@ def generate_ndjson_response(
                         np.ma.masked_where(lv_only.T == 0, lv_only.T),
                         cmap='Reds', alpha=0.5, origin='lower'
                     )
+                    # ============================================================
+# 可选叠加：左心肌 / 左心房
+# 如需显示，只要把下面注释去掉即可
+# ============================================================
 
+# # 左心肌 LVWall（label=2）
+# lv_wall = (int_mask == 2).astype(np.uint8)
+# ax.imshow(
+#     np.ma.masked_where(lv_wall.T == 0, lv_wall.T),
+#     cmap='Blues', alpha=0.35, origin='lower'
+# )
+
+# # 左心房 LA（label=3）
+# la_mask = (int_mask == 3).astype(np.uint8)
+# ax.imshow(
+#     np.ma.masked_where(la_mask.T == 0, la_mask.T),
+#     cmap='Greens', alpha=0.35, origin='lower'
+# )
                     au_key, ap_key, an_key = (
                         axis_keys[:3] if phase == "ED" else axis_keys[3:]
                     )
@@ -748,7 +941,7 @@ def generate_ndjson_response(
                 )
                 plt.close(fig)
                 return fname
-
+            #"""
             if masks2:
                 overlay_2ch_file = _render_view(
                     "2CH", masks2, orig2_data, spacing2, ED_i2, ES_i2,
@@ -761,6 +954,60 @@ def generate_ndjson_response(
                     ("axis_u_4ch_ed", "apex_4ch_ed", "annulus_mid_4ch_ed",
                      "axis_u_4ch_es", "apex_4ch_es", "annulus_mid_4ch_es")
                 )
+                
+            video_overlay_dirs = {}
+
+            def _export_video_overlays(view_name, masks_v, orig_v, spacing_v, result, is_video_view):
+                if not is_video_view or not masks_v:
+                    return None
+
+                ts_dir = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                folder_name = f"overlay_frames_{view_name.lower()}_{ts_dir}"
+                folder_path = os.path.join(RESULT_FOLDER, folder_name)
+                os.makedirs(folder_path, exist_ok=True)
+
+                print(f"[INFO] 导出视频 overlay: {view_name}, 共 {len(masks_v)} 帧 -> {folder_path}")
+
+                axis_prefix = view_name.lower()
+
+                for frame_i in range(len(masks_v)):
+                    mask = masks_v[frame_i]
+                    bg = (orig_v[:, :, frame_i] if orig_v is not None and orig_v.ndim == 3 else orig_v)
+
+                    out_png = os.path.join(folder_path, f"{view_name.lower()}_{frame_i:03d}.png")
+
+                    _save_single_frame_overlay(
+                        save_path=out_png,
+                        view_name=view_name,
+                        frame_i=frame_i,
+                        mask=mask,
+                        bg=bg,
+                        spacing=spacing_v,
+                        axis_u_override=None,      # 全帧排查时先不强绑 ED/ES 的轴
+                        apex_mm=None,
+                        annulus_mid_mm=None,
+                        n_discs=calculator.n,
+                        band_frac=calculator.band_frac,
+                        min_band_points=calculator.min_band_points,
+                    )
+
+                return folder_name
+            #"""
+            if masks2:
+                folder_2ch = _export_video_overlays(
+                    "2CH", masks2, orig2_data, spacing2, result, is_video_2ch
+                )
+                if folder_2ch:
+                    video_overlay_dirs["2ch"] = folder_2ch
+
+            if masks4:
+                folder_4ch = _export_video_overlays(
+                    "4CH", masks4, orig4_data, spacing4, result, is_video_4ch
+                )
+                if folder_4ch:
+                    video_overlay_dirs["4ch"] = folder_4ch
+            #"""
+                    
         except Exception as e:
             print(f"[WARN] Overlay failed: {e}")
             traceback.print_exc()
@@ -825,7 +1072,10 @@ def generate_ndjson_response(
             resp_data["overlay_2ch_url"] = f"{BASE_URL}/results/{overlay_2ch_file}"
         if overlay_4ch_file:
             resp_data["overlay_4ch_url"] = f"{BASE_URL}/results/{overlay_4ch_file}"
-
+        if video_overlay_dirs:
+            resp_data["video_overlay_dirs"] = {
+                k: f"{BASE_URL}/results/{v}" for k, v in video_overlay_dirs.items()
+            }
         yield json.dumps({"result": resp_data}) + "\n"
 
     except Exception as e:
@@ -969,38 +1219,43 @@ def analyze():
         annulus_strategy = request.form.get("annulus_strategy", "auto")
         patient_uid = request.form.get("patient_uid", "").strip()
 
+        age_raw = request.form.get("age", "").strip()
+        patient_data = {
+            "patient_uid": patient_uid,
+            "name": request.form.get("name", "").strip(),
+            "age": int(age_raw) if age_raw else None,
+            "gender": request.form.get("gender", "").strip(),
+        }
+
         path2ch = path4ch = None
         spacing2_override = spacing4_override = None
+        is_video_2ch = False
+        is_video_4ch = False
 
         if file_2ch and file_2ch.filename:
-            path2ch, sp2 = save_upload(file_2ch, UPLOAD_FOLDER, "2ch_")
+            path2ch, sp2, is_video_2ch = save_upload(file_2ch, UPLOAD_FOLDER, "2ch_")
             if sp2:
                 spacing2_override = sp2
 
         if file_4ch and file_4ch.filename:
-            path4ch, sp4 = save_upload(file_4ch, UPLOAD_FOLDER, "4ch_")
+            path4ch, sp4, is_video_4ch = save_upload(file_4ch, UPLOAD_FOLDER, "4ch_")
             if sp4:
                 spacing4_override = sp4
-
-        patient_data = {
-            'patient_uid': patient_uid,
-            'name': request.form.get("name"),
-            'age': request.form.get("age"),
-            'gender': request.form.get("gender"),
-        }
 
         return Response(
             generate_ndjson_response(
                 path2ch, path4ch, patient_data,
                 algorithm, annulus_strategy,
-                spacing2_override, spacing4_override
+                spacing2_override, spacing4_override,
+                is_video_2ch=is_video_2ch,
+                is_video_4ch=is_video_4ch
             ),
             mimetype='application/x-ndjson'
         )
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 # ──────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
