@@ -1,6 +1,6 @@
 MYSQL_HOST="localhost"
 MYSQL_USER="root"
-MYSQL_PASSWORD="hch13579"
+MYSQL_PASSWORD="556904452"
 MYSQL_DB="heart_echo"
 
 UPLOAD_FOLDER="uploads"
