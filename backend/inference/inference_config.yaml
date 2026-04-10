@@ -1,0 +1,31 @@
+# 推理配置文件
+
+# 模型配置
+checkpoint: "checkpoints/kfold/best.pth"
+num_classes: 7
+
+# 推理配置
+image_size: 224
+batch_size: 32
+device: "cuda"
+
+# 输入输出
+input: ~            # 单图路径 (可选)
+input_dir: ~        # 图像目录路径 (可选)
+output: "inference_results.json"
+
+# 搜索配置
+recursive: true
+
+# 类别名称 (仅供参考)
+class_names:
+  - A4C       # 心尖四腔心
+  - PL        # 胸骨旁长轴
+  - PSAV      # 胸骨旁短轴-主动脉瓣
+  - PSMV      # 胸骨旁短轴-二尖瓣
+  - Random    # 随机图像
+  - SC        # 剑突下四腔心
+  - A2C       # 心尖两腔心 (需CAMUS数据)
+
+# 支持的图像格式
+# JPG, PNG, BMP, TIFF, NIfTI (.nii, .nii.gz)

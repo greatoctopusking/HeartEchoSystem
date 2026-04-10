@@ -1,113 +1,57 @@
 import os
-import shutil
-import subprocess
-import numpy as np
-import nibabel as nib
-import torch
 
-from config import *
+from model_infer_nnunet import run_inference as run_inference_nnunet
+from model_infer_onnx import run_inference as run_inference_onnx
 
-
-def detect_device():
-    if torch.cuda.is_available():
-        print(">>> Using GPU (CUDA)")
-        return "cuda"
-    else:
-        print(">>> Using CPU")
-        return "cpu"
+#可选：默认 CAMUS/普通 NIfTI 是否优先走 ONNX
+DEFAULT_PREFER_ONNX=True
 
 
-def run_inference(image_path, case_name, dataset_name):
+def _normalize_source_type(source_type:str) -> str:
+    if not source_type:
+        return "camus"
+    s=str(source_type).strip().lower()
+    if s in ("video","avi","mp4","mov"):
+        return "video"
+    return "camus"
+
+
+def run_inference(
+    image_path,
+    case_name,
+    dataset_name,
+    is_video=False,
+    prefer_onnx=DEFAULT_PREFER_ONNX,
+    source_type=None,
+):
     """
-    执行 nnUNet 推理
-    返回:
-        output_dir
-        所有预测 mask 路径列表
-    """
-    print(f"Processing file: {image_path}")
-    print(f"Using dataset: {dataset_name}")
+    统一推理入口
 
+    路由规则：
+    1. 视频输入 -> 强制 nnUNet
+    2. 非视频输入 + prefer_onnx=True -> ONNX
+    3. 非视频输入 + prefer_onnx=False -> nnUNet
+
+    返回格式与旧版保持一致：
+        output_dir,pred_paths
+    """
     if not os.path.exists(image_path):
-        raise FileNotFoundError(f"输入文件不存在: {image_path}")
+        raise FileNotFoundError(f"输入文件不存在:{image_path}")
 
-    orig_img = nib.load(image_path)
-    data = orig_img.get_fdata().astype(np.float32)
-    header = orig_img.header
+    src=_normalize_source_type(source_type)
 
-    if data.ndim != 3:
-        raise RuntimeError(f"Input must be 3D time-sequence (H,W,T), but got shape={data.shape}")
+    #is_video 优先级最高
+    if is_video or src == "video":
+        print("[ROUTER] 检测到视频输入，强制使用 nnUNet")
+        return run_inference_nnunet(image_path,case_name,dataset_name)
 
-    if data.shape[2] <= 0:
-        raise RuntimeError("输入序列时间帧数为 0")
+    if prefer_onnx:
+        try:
+            print("[ROUTER] 非视频输入，优先使用 ONNX")
+            return run_inference_onnx(image_path,case_name,dataset_name)
+        except Exception as e:
+            print(f"[ROUTER] ONNX 推理失败，自动回退 nnUNet:{e}")
+            return run_inference_nnunet(image_path,case_name,dataset_name)
 
-    if not os.environ.get("nnUNet_raw"):
-        raise RuntimeError("nnUNet environment variables not set correctly")
-
-    case_input_dir = os.path.join(UPLOAD_FOLDER, f"nnunet_input_{case_name}")
-    if os.path.exists(case_input_dir):
-        shutil.rmtree(case_input_dir)
-    os.makedirs(case_input_dir, exist_ok=True)
-
-    output_dir = os.path.join(RESULT_FOLDER, case_name)
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-
-    T = data.shape[2]
-
-    zooms = header.get_zooms()
-    dx = float(zooms[0]) if len(zooms) > 0 else 1.0
-    dy = float(zooms[1]) if len(zooms) > 1 else 1.0
-
-    print(f"[INFO] Original spacing: dx={dx}, dy={dy}, zooms={zooms}")
-
-    affine_2d = np.diag([dx, dy, 1.0, 1.0])
-
-    for t in range(T):
-        frame = data[:, :, t].astype(np.float32)
-
-        p1, p99 = np.percentile(frame, [1, 99])
-        if p99 > p1:
-            frame = np.clip((frame - p1) / (p99 - p1), 0.0, 1.0) * 255.0
-        else:
-            mn, mx = float(frame.min()), float(frame.max())
-            if mx > mn:
-                frame = (frame - mn) / (mx - mn) * 255.0
-            else:
-                frame = np.zeros_like(frame, dtype=np.float32)
-
-        frame_nii = nib.Nifti1Image(frame.astype(np.float32), affine_2d)
-        frame_nii.header.set_zooms((dx, dy))
-
-        frame_name = f"{case_name}_{t:03d}"
-        input_path = os.path.join(case_input_dir, f"{frame_name}_0000.nii.gz")
-        nib.save(frame_nii, input_path)
-
-    command = [
-        "nnUNetv2_predict",
-        "-i", case_input_dir,
-        "-o", output_dir,
-        "-d", dataset_name,
-        "-c", NNUNET_CONFIGURATION,
-        "-f", str(NNUNET_FOLD),
-        "--disable_tta",
-        "-device", "cpu",
-        "-npp", "1",
-        "-nps", "1",
-    ]
-
-    print("Running command:", " ".join(command))
-    proc = subprocess.run(command, capture_output=True, text=True)
-
-    if proc.returncode != 0:
-        raise RuntimeError(f"nnUNet failed:\n{proc.stderr}")
-
-    pred_paths = []
-    for t in range(T):
-        frame_name = f"{case_name}_{t:03d}"
-        pred_file = os.path.join(output_dir, f"{frame_name}.nii.gz")
-        if not os.path.exists(pred_file):
-            raise RuntimeError(f"预测结果缺失: {pred_file}")
-        pred_paths.append(pred_file)
-
-    return output_dir, pred_paths
+    print("[ROUTER] 非视频输入，按配置使用 nnUNet")
+    return run_inference_nnunet(image_path,case_name,dataset_name)
