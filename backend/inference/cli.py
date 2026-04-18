@@ -13,7 +13,7 @@ import torch
 
 from .predict import predict_single, predict_directory, load_model
 from .transforms import get_val_transforms
-from .constants import NUM_CLASSES, DEFAULT_IMAGE_SIZE
+from .constants import NUM_CLASSES, DEFAULT_IMAGE_SIZE, get_class_names
 
 
 def parse_args():
@@ -63,10 +63,18 @@ def parse_args():
     )
     
     parser.add_argument(
+        '--task_type',
+        type=str,
+        default='multi_class',
+        choices=['multi_class', 'binary'],
+        help='任务类型: multi_class(7类) 或 binary(二分类)'
+    )
+    
+    parser.add_argument(
         '--num-classes',
         type=int,
-        default=NUM_CLASSES,
-        help='分类类别数'
+        default=None,
+        help='分类类别数 (根据task_type自动确定)'
     )
     
     parser.add_argument(
@@ -117,9 +125,16 @@ def main():
         args.input_dir = config.get('input_dir', args.input_dir)
         args.output = config.get('output', args.output)
         args.batch_size = config.get('batch_size', args.batch_size)
-        args.num_classes = config.get('num_classes', args.num_classes)
+        args.task_type = config.get('task_type', args.task_type)
         args.device = config.get('device', args.device)
         args.recursive = config.get('recursive', args.recursive)
+    
+    # 根据 task_type 确定 num_classes
+    if args.num_classes is None:
+        args.num_classes = 2 if args.task_type == 'binary' else 7
+    
+    # 获取对应的类别名称
+    class_names = get_class_names(args.task_type)
     
     # 优先级：命令行参数 > 配置文件 > 默认值
     # 如果 checkpoint 仍为空，报错
@@ -137,6 +152,7 @@ def main():
         sys.exit(1)
     
     print(f"Using device: {args.device}")
+    print(f"Task type: {args.task_type} ({args.num_classes} classes)")
     print(f"Loading model from {args.checkpoint}...")
     
     transform = get_val_transforms(args.image_size)
@@ -146,7 +162,7 @@ def main():
     
     if args.input:
         print(f"\nPredicting single image: {args.input}")
-        result = predict_single(model, args.input, transform=transform, device=args.device)
+        result = predict_single(model, args.input, transform=transform, device=args.device, class_names=class_names)
         
         print(f"\nResult:")
         print(f"  Predicted Class: {result['predicted_class']}")
@@ -173,7 +189,8 @@ def main():
             transform=transform,
             device=args.device,
             batch_size=args.batch_size,
-            recursive=args.recursive
+            recursive=args.recursive,
+            class_names=class_names
         )
         
         print(f"\nSummary:")

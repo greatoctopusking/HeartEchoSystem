@@ -1,5 +1,6 @@
 import os
 import shutil
+import sys
 import numpy as np
 import nibabel as nib
 import torch
@@ -9,6 +10,9 @@ from config import *
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 NNUNET_MODEL_ROOT = os.path.join(PROJECT_ROOT, "models", "nnUNet_results")
+
+# 添加 models 目录到 Python 路径，以便导入 nnunetv2
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "models"))
 
 _predictors = {"2ch": None, "4ch": None}
 
@@ -22,9 +26,33 @@ def detect_device():
         return torch.device("cpu")
 
 
+def check_model_available(view: str) -> bool:
+    """检查 nnUNet 模型是否可用"""
+    dataset_name = NNUNET_DATASET_2CH if view == "2ch" else NNUNET_DATASET_4CH
+    model_folder = os.path.join(
+        NNUNET_MODEL_ROOT,
+        dataset_name,
+        f"nnUNetTrainer__nnUNetPlans__{NNUNET_CONFIGURATION}"
+    )
+    return os.path.exists(model_folder)
+
+
 def _get_predictor(view: str):
     """单例模式加载 nnUNet Predictor"""
     if _predictors[view] is None:
+        # 先检查模型是否存在
+        if not check_model_available(view):
+            dataset_name = NNUNET_DATASET_2CH if view == "2ch" else NNUNET_DATASET_4CH
+            model_folder = os.path.join(
+                NNUNET_MODEL_ROOT,
+                dataset_name,
+                f"nnUNetTrainer__nnUNetPlans__{NNUNET_CONFIGURATION}"
+            )
+            raise FileNotFoundError(
+                f"nnUNet model not found: {model_folder}\n"
+                f"Please train the model or use ONNX inference instead."
+            )
+        
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
         device = detect_device()

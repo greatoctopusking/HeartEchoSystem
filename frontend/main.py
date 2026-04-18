@@ -1,5 +1,5 @@
 #心脏超声智能分析系统PyQt5前端
-import sys,json,os,uuid,requests
+import sys,json,os,uuid,requests,tempfile
 from typing import Optional,TYPE_CHECKING
 from PyQt5.QtWidgets import (
     QApplication,QDialog,QVBoxLayout,QHBoxLayout,QLabel,QLineEdit,
@@ -10,7 +10,9 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt,QThread,pyqtSignal,QTimer
 #补充QPainter,QBrush,QColor 用于登录界面美化
-from PyQt5.QtGui import QFont,QPixmap,QPainter,QBrush,QColor
+from PyQt5.QtGui import QFont,QPixmap,QPainter,QBrush,QColor,QIcon
+from optical_flow_viewer import launch_optical_flow
+
 import numpy as np
 import matplotlib
 matplotlib.use("Qt5Agg")
@@ -419,17 +421,41 @@ class LoginDialog(QDialog):
 
     def do_login(self):
         try:
-            r=requests.post(f"{BASE_URL}/login",
-                              json={"username": self.username_input.text().strip(),
-                                    "password": self.password_input.text().strip()},
-                              timeout=20)
+            r = requests.post(
+                f"{BASE_URL}/login",
+                json={
+                    "username": self.username_input.text().strip(),
+                    "password": self.password_input.text().strip()
+                },
+                timeout=20
+            )
             if r.status_code == 200:
-                self.token=r.json().get("token")
+                self.token = r.json().get("token")
                 self.accept()
             else:
-                QMessageBox.critical(self,"失败","登录失败: " + r.text)
+                QMessageBox.critical(self, "失败", "登录失败: " + r.text)
         except Exception as e:
-            QMessageBox.critical(self,"错误",f"连接服务器失败: {e}")
+            QMessageBox.critical(self, "错误", f"连接服务器失败: {e}")
+
+    def do_login0(self):
+        # 登录验证
+        username = self.username_input.text().strip()
+        password = self.password_input.text().strip()
+        
+        # 简单验证：账号密码不能为空
+        if not username or not password:
+            QMessageBox.warning(self,"提示","请输入用户名和密码")
+            return
+        
+        # 生成真正的 JWT Token
+        try:
+            from jwt_utils import generate_token
+            self.token = generate_token(username, expire_hours=12)
+            print(f"[INFO] JWT Token generated for user: {username}")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self,"错误",f"Token生成失败: {e}")
+            return
 
 
 # 自适应图片 Label
@@ -488,7 +514,8 @@ class TrendCanvas(FigureCanvasQTAgg):
             return
 
         records=sorted(records,key=lambda r: r.get('create_time',''))
-        labels  =[r['create_time'][-5:] for r in records]
+        # 提取年月日 (YYYY-MM-DD)
+        labels  =[r['create_time'][:10] for r in records]
         x       =list(range(len(records)))
         lvef_v  =[float(r.get('lvef',0)) for r in records]
         edv_v   =[float(r.get('edv',0)) for r in records]
@@ -532,7 +559,8 @@ class AnalysisWorker(QThread):
     analysis_error   =pyqtSignal(str)
 
     def __init__(self,token,file_2ch,file_4ch,patient_data,
-                 algorithm,annulus_strategy,base_url):
+                 algorithm,annulus_strategy,base_url,
+                 auto_detect=False,auto_detect_result=None):
         super().__init__()
         self.token           =token
         self.file_2ch        =file_2ch
@@ -541,6 +569,8 @@ class AnalysisWorker(QThread):
         self.algorithm       =algorithm
         self.annulus_strategy=annulus_strategy
         self.base_url        =base_url
+        self.auto_detect     =auto_detect
+        self.auto_detect_result=auto_detect_result or {}
         self._running        =True
 
     def run(self):
@@ -548,16 +578,32 @@ class AnalysisWorker(QThread):
         try:
             headers={"Authorization": f"Bearer {self.token}",
                        "Accept": "application/ndjson"}
-            if self.file_2ch:
-                files['file_2ch']=(os.path.basename(self.file_2ch),
-                                     open(self.file_2ch,'rb'))
-            if self.file_4ch:
-                files['file_4ch']=(os.path.basename(self.file_4ch),
-                                     open(self.file_4ch,'rb'))
+            
+            # 自动检测模式：使用检测到的文件
+            if self.auto_detect:
+                detected_files = self.auto_detect_result.get('files', {})
+                if detected_files.get('2ch'):
+                    files['file_2ch']=(os.path.basename(detected_files['2ch']),
+                                         open(detected_files['2ch'],'rb'))
+                if detected_files.get('4ch'):
+                    files['file_4ch']=(os.path.basename(detected_files['4ch']),
+                                         open(detected_files['4ch'],'rb'))
+            else:
+                # 传统模式
+                if self.file_2ch:
+                    files['file_2ch']=(os.path.basename(self.file_2ch),
+                                         open(self.file_2ch,'rb'))
+                if self.file_4ch:
+                    files['file_4ch']=(os.path.basename(self.file_4ch),
+                                         open(self.file_4ch,'rb'))
 
             form_data=dict(self.patient_data)
             form_data['algorithm']       =self.algorithm
-            form_data['annulus_strategy']=self.annulus_strategy   
+            form_data['annulus_strategy']=self.annulus_strategy
+            
+            # 自动检测模式标志
+            if self.auto_detect:
+                form_data['auto_detect']='true'
 
             resp=requests.post(f"{self.base_url}/analyze",
                                  files=files,data=form_data,
@@ -662,9 +708,18 @@ class LV3DViewerWindow(QMainWindow):
             opacity=0.95
         )
 
+        # 添加坐标轴 (X=红, Y=绿, Z=蓝)
+        self.plotter.add_axes(line_width=2, color='white')
+        
+        # 添加网格线帮助观察方向
+        try:
+            self.plotter.show_grid(color='gray')
+        except:
+            pass
+
         self.plotter.set_background("black")
-        self.plotter.view_isometric()
-        self.plotter.reset_camera()
+        # 设置心尖朝上的视角
+        self._reset_to_apex_view()
 
         self.vertices_series=verts_list
         self._init_dock()
@@ -673,8 +728,27 @@ class LV3DViewerWindow(QMainWindow):
         self.auto_play_timer.setInterval(80)
         self.auto_play_timer.timeout.connect(self._next_frame)
 
+    def _reset_to_apex_view(self):
+        """重置视角为心尖朝上（正面视图）"""
+        if not self.plotter:
+            return
+        try:
+            # Z轴朝前（指向观察者/屏幕外）
+            # 相机在Z轴负方向，看向原点，这样Z轴正方向指向观察者
+            self.plotter.camera.position = [0, 0, -10]  # Z轴负方向(后方)
+            self.plotter.camera.focal_point = [0, 0, 0] # 看向原点
+            self.plotter.camera.up = [0, 1, 0]          # Y轴朝上(屏幕上方)
+            self.plotter.reset_camera()
+        except Exception as e:
+            print(f"[WARN] 3D view reset failed: {e}")
+            try:
+                self.plotter.view_xy()
+                self.plotter.reset_camera()
+            except:
+                pass
+
     def _init_dock(self):
-        dock=QDockWidget("心动周期控制",self)
+        dock=QDockWidget("心动周期控制 | 心尖已朝上",self)
         dock.setFeatures(QDockWidget.NoDockWidgetFeatures)
 
         w=QWidget()
@@ -710,12 +784,21 @@ class LV3DViewerWindow(QMainWindow):
         )
         self.play_btn.toggled.connect(self._toggle_play)
 
+        self.reset_view_btn=QPushButton("🔄 重置视角")
+        self.reset_view_btn.setStyleSheet(
+            "QPushButton{background:#17a2b8;color:white;padding:5px 12px;"
+            "border-radius:4px;font-weight:bold;}"
+        )
+        self.reset_view_btn.clicked.connect(self._reset_to_apex_view)
+        self.reset_view_btn.setToolTip("重置为心尖朝上视角")
+
         lay.addWidget(self.frame_lbl)
         lay.addWidget(self.slider,stretch=1)
         lay.addWidget(self.speed_text_lbl)
         lay.addWidget(self.speed_slider)
         lay.addWidget(self.speed_lbl)
         lay.addWidget(self.play_btn)
+        lay.addWidget(self.reset_view_btn)
 
         dock.setWidget(w)
         self.addDockWidget(Qt.BottomDockWidgetArea,dock)
@@ -795,7 +878,7 @@ class ComparisonPanel(QGroupBox):
 
     def __init__(self,parent=None):
         super().__init__("算法对比",parent)
-        self.setFont(QFont("Arial",12,QFont.Bold))
+        self.setFont(QFont("Microsoft YaHei",12,QFont.Bold))
         lay=QVBoxLayout()
         self._table=QTableWidget(0,4)
         self._table.setHorizontalHeaderLabels(["算法","LVEF (%)","EDV (ml)","ESV (ml)"])
@@ -843,7 +926,7 @@ class HistoryDetailDialog(QDialog):
         lay.setContentsMargins(20,20,20,20)
 
         info=QGroupBox("基本信息与临床指标")
-        info.setFont(QFont("Arial",13,QFont.Bold))
+        info.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         fl=QFormLayout()
         fl.setSpacing(10)
         fl.setContentsMargins(16,16,16,16)
@@ -851,10 +934,10 @@ class HistoryDetailDialog(QDialog):
         lvef_v=float(self.record.get('lvef',0))
         status_txt,status_style=self._lvef_status(lvef_v)
         lvef_lbl  =QLabel(f"{lvef_v:.2f} %")
-        lvef_lbl.setFont(QFont("Arial",14,QFont.Bold))
+        lvef_lbl.setFont(QFont("Microsoft YaHei",14,QFont.Bold))
         status_lbl=QLabel(status_txt)
         status_lbl.setStyleSheet(status_style)
-        status_lbl.setFont(QFont("Arial",13,QFont.Bold))
+        status_lbl.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         lvef_row=QHBoxLayout()
         lvef_row.addWidget(lvef_lbl)
         lvef_row.addSpacing(12)
@@ -871,26 +954,44 @@ class HistoryDetailDialog(QDialog):
             ("视图模式",  self.record.get('view_mode','--')),
             ("瓣环定位策略",self._translate_strategy(self.record.get('annulus_strategy','--'))),
         ]:
-            lbl=QLabel(val)
-            lbl.setFont(QFont("Arial",12))
+            lbl=QLabel(str(val))
+            # 强制设置完整样式：字体、大小、粗细、颜色
+            lbl.setStyleSheet("font-family:Microsoft YaHei;font-size:12pt;font-weight:bold;color:#000;")
             fl.addRow(f"{name}:",lbl)
         fl.addRow("LVEF:",lvef_row)
-        fl.addRow("EDV:",QLabel(f"{float(self.record.get('edv',0)):.2f} ml"))
-        fl.addRow("ESV:",QLabel(f"{float(self.record.get('esv',0)):.2f} ml"))
+        
+        edv_lbl=QLabel(f"{float(self.record.get('edv',0)):.2f} ml")
+        edv_lbl.setStyleSheet("font-family:Microsoft YaHei;font-size:12pt;font-weight:bold;color:#000;")
+        fl.addRow("EDV:",edv_lbl)
+        
+        esv_lbl=QLabel(f"{float(self.record.get('esv',0)):.2f} ml")
+        esv_lbl.setStyleSheet("font-family:Microsoft YaHei;font-size:12pt;font-weight:bold;color:#000;")
+        fl.addRow("ESV:",esv_lbl)
         info.setLayout(fl)
 
         img_group=QGroupBox("历史分析影像")
-        img_group.setFont(QFont("Arial",13,QFont.Bold))
+        img_group.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         img_lay=QVBoxLayout()
-        self.overlay_lbl=ScaledImageLabel("加载中...")
-        self.overlay_lbl.setMinimumHeight(420)
-        img_lay.addWidget(self.overlay_lbl)
+        
+        # 创建tab切换2CH和4CH
+        self.overlay_tabs=QTabWidget()
+        self.overlay_tabs.setFont(QFont("Microsoft YaHei",11))
+        
+        self.overlay_2ch_lbl=ScaledImageLabel("等待2CH影像...")
+        self.overlay_2ch_lbl.setMinimumHeight(400)
+        self.overlay_4ch_lbl=ScaledImageLabel("等待4CH影像...")
+        self.overlay_4ch_lbl.setMinimumHeight(400)
+        
+        self.overlay_tabs.addTab(self.overlay_2ch_lbl,"2CH（两腔心）")
+        self.overlay_tabs.addTab(self.overlay_4ch_lbl,"4CH（四腔心）")
+        
+        img_lay.addWidget(self.overlay_tabs)
         img_group.setLayout(img_lay)
 
         lay.addWidget(info)
         lay.addWidget(img_group,stretch=1)
         self.setLayout(lay)
-        self._load_image()
+        self._load_images()
 
     @staticmethod
     def _translate_strategy(key: str) -> str:
@@ -913,28 +1014,11 @@ class HistoryDetailDialog(QDialog):
             return "中度降低","color:#fd7e14;"
         return "重度降低","color:#dc3545;"
 
-    def _load_image0(self):
+    def _load_images(self):
         rpath=self.record.get('result_path','')
         if not rpath:
-            self.overlay_lbl.setText("无影像记录")
-            return
-        try:
-            resp=requests.get(f"{BASE_URL}/results/{rpath}",
-                                headers={"Authorization": f"Bearer {self.token}"},
-                                timeout=15)
-            if resp.status_code == 200:
-                pix=QPixmap()
-                pix.loadFromData(resp.content)
-                self.overlay_lbl.set_image(pix)
-            else:
-                self.overlay_lbl.setText("图片加载失败")
-        except Exception as e:
-            self.overlay_lbl.setText(f"图片加载失败: {e}")
-
-    def _load_image(self):
-        rpath=self.record.get('result_path','')
-        if not rpath:
-            self.overlay_lbl.setText("无影像记录")
+            self.overlay_2ch_lbl.setText("无影像记录")
+            self.overlay_4ch_lbl.setText("无影像记录")
             return
 
         try:
@@ -942,27 +1026,51 @@ class HistoryDetailDialog(QDialog):
             paths=[p for p in rpath.split(";") if p.strip()]
 
             if not paths:
-                self.overlay_lbl.setText("无影像记录")
+                self.overlay_2ch_lbl.setText("无影像记录")
+                self.overlay_4ch_lbl.setText("无影像记录")
                 return
 
-            #默认加载第一张
-            first=paths[0]
-
-            resp=requests.get(
-                f"{BASE_URL}/results/{first}",
-                headers={"Authorization": f"Bearer {self.token}"},
-                timeout=15
-            )
-
-            if resp.status_code == 200:
+            # 分析视图模式来确定哪个是2CH哪个是4CH
+            view_mode=self.record.get('view_mode','')
+            
+            # 加载所有图片
+            for path in paths:
+                resp=requests.get(
+                    f"{BASE_URL}/results/{path}",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                    timeout=15
+                )
+                if resp.status_code != 200:
+                    continue
+                    
                 pix=QPixmap()
                 pix.loadFromData(resp.content)
-                self.overlay_lbl.set_image(pix)
-            else:
-                self.overlay_lbl.setText("图片加载失败")
-
+                
+                # 根据文件名判断是2CH还是4CH
+                if '2ch' in path.lower():
+                    self.overlay_2ch_lbl.setPixmap(pix)
+                    self.overlay_2ch_lbl._raw_pixmap=pix
+                elif '4ch' in path.lower():
+                    self.overlay_4ch_lbl.setPixmap(pix)
+                    self.overlay_4ch_lbl._raw_pixmap=pix
+                else:
+                    # 无法判断，默认第一张给当前视图
+                    if not hasattr(self.overlay_2ch_lbl, '_raw_pixmap') or self.overlay_2ch_lbl._raw_pixmap is None:
+                        self.overlay_2ch_lbl.setPixmap(pix)
+                        self.overlay_2ch_lbl._raw_pixmap=pix
+                    else:
+                        self.overlay_4ch_lbl.setPixmap(pix)
+                        self.overlay_4ch_lbl._raw_pixmap=pix
+            
+            # 如果没有加载到图片，显示提示
+            if not self.overlay_2ch_lbl._raw_pixmap:
+                self.overlay_2ch_lbl.setText("无2CH影像")
+            if not self.overlay_4ch_lbl._raw_pixmap:
+                self.overlay_4ch_lbl.setText("无4CH影像")
+                
         except Exception as e:
-            self.overlay_lbl.setText(f"图片加载失败: {e}")
+            self.overlay_2ch_lbl.setText(f"加载失败: {e}")
+            self.overlay_4ch_lbl.setText(f"加载失败: {e}")
 
 
 
@@ -978,13 +1086,153 @@ class MainWindow(QMainWindow):
         self.worker: Optional[AnalysisWorker]         =None
         self._build_ui()
 
+
+    def on_analysis_finished(self, result):
+        self.last_result = result
+
+    
+    def _ensure_local_mask_file(self, mask_url: str) -> str:
+        if not mask_url:
+            raise ValueError("mask_url 为空")
+
+        if os.path.exists(mask_url):
+            return mask_url
+
+        headers = {"Authorization": f"Bearer {self.token}"}
+        resp = requests.get(mask_url, headers=headers, timeout=60)
+        if resp.status_code != 200:
+            raise ValueError(f"下载 mask 失败: {resp.status_code} {resp.text}")
+
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" in content_type or "application/json" in content_type:
+            raise ValueError(f"mask 返回的不是 NIfTI 文件，而是: {content_type}")
+
+        raw = resp.content
+        if mask_url.lower().endswith(".nii.gz"):
+            if len(raw) < 2 or raw[:2] != b"\x1f\x8b":
+                raise ValueError("下载到的 .nii.gz 内容不是 gzip 格式")
+            suffix = ".nii.gz"
+        else:
+            suffix = ".nii"
+
+        fd, local_path = tempfile.mkstemp(suffix=suffix, prefix="optflow_mask_")
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+
+        return local_path
+
+        
+    def on_btn_optical_flow_4ch_clicked0(self):
+        """
+        4CH LV轮廓光流追踪（使用分割mask）
+        """
+
+        # 1️⃣ 检查有没有分析结果
+        if not hasattr(self, "last_result"):
+            QMessageBox.warning(self, "提示", "请先完成分析")
+            return
+
+        result = self.last_result
+
+        # 2️⃣ 获取mask路径
+        mask_url = result.get("mask_path_4ch")
+
+        if not mask_url:
+            QMessageBox.warning(self, "提示", "没有找到4CH分割结果")
+            return
+        """
+        # 3️⃣ URL -> 本地路径（关键）
+        # 例如: http://127.0.0.1:5000/results/xxx.nii.gz
+        mask_path = mask_url.replace("http://127.0.0.1:5000/", "")
+
+        if not os.path.exists(mask_path):
+            QMessageBox.warning(self, "提示", f"mask文件不存在:\n{mask_path}")
+            return
+        """
+        try:
+            mask_path = self._ensure_local_mask_file(mask_url)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"mask 获取失败:\n{e}")
+            return
+                
+        
+        # 4️⃣ 原始影像路径
+        if not hasattr(self, "file_4ch_path"):
+            QMessageBox.warning(self, "提示", "没有4CH影像")
+            return
+
+        img_path = self.file_4ch_path
+
+        # 5️⃣ 启动光流（🔥核心）
+        launch_optical_flow(
+            self,
+            img_path,
+            "4CH LV轮廓光流",
+            mask_path=mask_path
+        )
+
+    def on_btn_optical_flow_2ch_clicked(self):
+        """
+        2CH LV轮廓光流追踪（使用分割mask）
+        """
+        if not hasattr(self, "last_result"):
+            QMessageBox.warning(self, "提示", "请先完成分析")
+            return
+        result = self.last_result
+        mask_url = result.get("mask_path_2ch")
+        if not mask_url:
+            QMessageBox.warning(self, "提示", "没有找到2CH分割结果")
+            return
+        try:
+            mask_path = self._ensure_local_mask_file(mask_url)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"mask 获取失败:\n{e}")
+            return
+                
+        if not self.file_2ch_path:
+            QMessageBox.warning(self, "提示", "没有2CH影像")
+            return
+        
+        launch_optical_flow(
+            self,
+            self.file_2ch_path,
+            "2CH LV轮廓光流",
+            mask_path=mask_path
+        )
+
+    def on_btn_optical_flow_4ch_clicked(self):
+        if not hasattr(self, "last_result"):
+            QMessageBox.warning(self, "提示", "请先完成分析")
+            return
+        result = self.last_result
+        mask_url = result.get("mask_path_4ch")
+        if not mask_url:
+            QMessageBox.warning(self, "提示", "没有找到4CH分割结果")
+            return
+        try:
+            mask_path = self._ensure_local_mask_file(mask_url)
+        except Exception as e:
+            QMessageBox.warning(self, "提示", f"mask 获取失败:\n{e}")
+            return
+                
+        if not self.file_4ch_path:
+            QMessageBox.warning(self, "提示", "没有4CH影像")
+            return
+        
+        launch_optical_flow(
+            self,
+            self.file_4ch_path,
+            "4CH LV轮廓光流",
+            mask_path=mask_path
+        )
+
     #整体布局
     def _build_ui(self):
         self.setWindowTitle("心脏超声智能分析系统-工作台")
         self.setMinimumSize(1300,900)
 
         self.tabs=QTabWidget()
-        self.tabs.setFont(QFont("Arial",13))
+        self.tabs.setFont(QFont("Microsoft YaHei",13))
         self.tab_analyze=QWidget()
         self.tab_history=QWidget()
         self.tabs.addTab(self.tab_analyze,"分析工作台")
@@ -1008,7 +1256,7 @@ class MainWindow(QMainWindow):
 
         #患者信息
         pat_grp=QGroupBox("患者信息")
-        pat_grp.setFont(QFont("Arial",13,QFont.Bold))
+        pat_grp.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         pat_fl=QFormLayout()
         pat_fl.setSpacing(10)
         pat_fl.setContentsMargins(14,14,14,14)
@@ -1035,9 +1283,9 @@ class MainWindow(QMainWindow):
         pat_fl.addRow("性别:",   self.gender_combo)
         pat_grp.setLayout(pat_fl)
 
-        #算法选择 + 瓣环策略（合并在同一 GroupBox）
-        algo_grp=QGroupBox("计算算法与瓣环定位策略")
-        algo_grp.setFont(QFont("Arial",13,QFont.Bold))
+        #算法选择（瓣环策略固定为自动检测）
+        algo_grp=QGroupBox("计算算法")
+        algo_grp.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         algo_lay=QFormLayout()
         algo_lay.setSpacing(10)
         algo_lay.setContentsMargins(14,14,14,14)
@@ -1048,49 +1296,77 @@ class MainWindow(QMainWindow):
             self.algo_combo.addItem(label,userData=key)
         self.algo_combo.currentIndexChanged.connect(self._on_algo_changed)
 
-        self.strategy_combo=QComboBox()
-        self.strategy_combo.setFixedHeight(34)
-        for key,label in ANNULUS_STRATEGY_OPTIONS:
-            self.strategy_combo.addItem(label,userData=key)
-        #默认选"自动检测"
-        self.strategy_combo.setCurrentIndex(0)
-
-        strategy_hint=QLabel(
-            "自动：推理后检测 mask 标签决定策略\n"
-            "极坐标：仅腔体(label 1)分割结果\n"
-            "Wall-LA：含壁(2)/左房(3)多类别结果")
-        strategy_hint.setStyleSheet("color:#888;font-size:11px;")
-        strategy_hint.setWordWrap(True)
-
         algo_lay.addRow("计算算法:",self.algo_combo)
-        algo_lay.addRow("瓣环策略:",self.strategy_combo)
-        algo_lay.addRow("",        strategy_hint)
         algo_grp.setLayout(algo_lay)
 
         #文件上传
         file_grp=QGroupBox("影像文件 (NIfTI / DICOM / Video)")
-        file_grp.setFont(QFont("Arial",13,QFont.Bold))
+        file_grp.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         file_lay=QVBoxLayout()
         file_lay.setContentsMargins(14,14,14,14)
         file_lay.setSpacing(10)
 
+        # 自动检测模式开关
+        auto_detect_row=QHBoxLayout()
+        self.auto_detect_checkbox=QPushButton("自动检测视图类型")
+        self.auto_detect_checkbox.setCheckable(True)
+        self.auto_detect_checkbox.setMinimumHeight(40)
+        self.auto_detect_checkbox.setStyleSheet("""
+            QPushButton {
+                background: #6c757d;
+                color: white;
+                padding: 10px 20px;
+                border-radius: 6px;
+                font-size: 15px;
+                font-weight: bold;
+            }
+            QPushButton:checked {
+                background: #0078D4;
+            }
+        """)
+        self.auto_detect_checkbox.clicked.connect(self._on_auto_detect_toggle)
+        
+        self.detect_view_btn=QPushButton("查看检测结果")
+        self.detect_view_btn.setEnabled(False)
+        self.detect_view_btn.setMinimumHeight(40)
+        self.detect_view_btn.setStyleSheet(
+            "background:#17a2b8;color:white;padding:10px 20px;border-radius:6px;font-size:15px;font-weight:bold;")
+        self.detect_view_btn.clicked.connect(self._show_detect_result)
+        
+        auto_detect_row.addWidget(self.auto_detect_checkbox)
+        auto_detect_row.addWidget(self.detect_view_btn)
+        auto_detect_row.addStretch()
+        file_lay.addLayout(auto_detect_row)
+        
+        # 检测结果显示标签
+        self.detect_result_label=QLabel("")
+        self.detect_result_label.setStyleSheet(
+            "color:#666;font-size:11px;padding:4px;background:#f8f9fa;border-radius:3px;")
+        self.detect_result_label.setWordWrap(True)
+        file_lay.addWidget(self.detect_result_label)
+        
+        # 文件选择按钮
         self.file2ch_btn  =QPushButton("选择 2CH 文件")
+        self.file2ch_btn.setMinimumHeight(36)
+        self.file2ch_btn.setStyleSheet("font-size:16px;font-weight:800;")
         self.file2ch_label=QLabel("未选择")
         self._style_file_label(self.file2ch_label)
         self.file4ch_btn  =QPushButton("选择 4CH 文件")
+        self.file4ch_btn.setMinimumHeight(36)
+        self.file4ch_btn.setStyleSheet("font-size:16px;font-weight:800;")
         self.file4ch_label=QLabel("未选择")
         self._style_file_label(self.file4ch_label)
 
         file_lay.addWidget(self.file2ch_btn)
         file_lay.addWidget(self.file2ch_label)
-        file_lay.addSpacing(6)
+        file_lay.addSpacing(12)
         file_lay.addWidget(self.file4ch_btn)
         file_lay.addWidget(self.file4ch_label)
         file_grp.setLayout(file_lay)
 
         #进度
         prog_grp=QGroupBox("分析进度")
-        prog_grp.setFont(QFont("Arial",13,QFont.Bold))
+        prog_grp.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         prog_lay=QVBoxLayout()
         prog_lay.setContentsMargins(14,14,14,14)
         self.status_lbl=QLabel("等待开始...")
@@ -1121,12 +1397,12 @@ class MainWindow(QMainWindow):
         right_lay.setSpacing(12)
 
         img_grp=QGroupBox("分析结果影像")
-        img_grp.setFont(QFont("Arial",13,QFont.Bold))
+        img_grp.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         img_inner=QVBoxLayout()
         img_inner.setContentsMargins(6,10,6,6)
 
         self.overlay_tabs=QTabWidget()
-        self.overlay_tabs.setFont(QFont("Arial",12))
+        self.overlay_tabs.setFont(QFont("Microsoft YaHei",12))
         self.overlay_tabs.setStyleSheet("""
             QTabBar::tab { min-width: 100px; padding: 6px 18px; font-size: 13px; }
             QTabBar::tab:selected { font-weight: bold; }
@@ -1142,34 +1418,59 @@ class MainWindow(QMainWindow):
         img_grp.setLayout(img_inner)
 
         data_grp=QGroupBox("临床分析指标")
-        data_grp.setFont(QFont("Arial",13,QFont.Bold))
+        data_grp.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
         data_lay=QHBoxLayout()
         data_lay.setContentsMargins(14,14,14,14)
 
         metrics_lay=QFormLayout()
         metrics_lay.setSpacing(8)
-        self.lvef_label        =QLabel("-- %");       self.lvef_label.setFont(QFont("Arial",14,QFont.Bold))
-        self.lvef_status       =QLabel("--");          self.lvef_status.setFont(QFont("Arial",13,QFont.Bold))
-        self.edv_label         =QLabel("-- ml");      self.edv_label.setFont(QFont("Arial",14,QFont.Bold))
-        self.esv_label         =QLabel("-- ml");      self.esv_label.setFont(QFont("Arial",14,QFont.Bold))
+        self.lvef_label        =QLabel("-- %");       self.lvef_label.setFont(QFont("Microsoft YaHei",14,QFont.Bold))
+        self.lvef_status       =QLabel("--");          self.lvef_status.setFont(QFont("Microsoft YaHei",13,QFont.Bold))
+        self.edv_label         =QLabel("-- ml");      self.edv_label.setFont(QFont("Microsoft YaHei",14,QFont.Bold))
+        self.esv_label         =QLabel("-- ml");      self.esv_label.setFont(QFont("Microsoft YaHei",14,QFont.Bold))
         self.algo_result_lbl   =QLabel("--");          self.algo_result_lbl.setStyleSheet("color:#0078D4;font-size:12px;")
-        self.strategy_result_lbl=QLabel("--");         self.strategy_result_lbl.setStyleSheet("color:#888;font-size:11px;")
 
         metrics_lay.addRow("LVEF:",     self.lvef_label)
         metrics_lay.addRow("状态:",      self.lvef_status)
         metrics_lay.addRow("EDV:",      self.edv_label)
         metrics_lay.addRow("ESV:",      self.esv_label)
-        metrics_lay.addRow("算法:",      self.algo_result_lbl)
-        metrics_lay.addRow("定位策略:",  self.strategy_result_lbl)    
-
+        metrics_lay.addRow("算法:",      self.algo_result_lbl)    
+        """
         btn_col=QVBoxLayout()
         self.view3d_btn=QPushButton("查看3D模型")
         self.view3d_btn.setEnabled(False)
-        self.view3d_btn.setFixedHeight(50)
+        self.view3d_btn.setToolTip("心功能分析完成后可查看3D动态模型")
+        self.view3d_btn.setFixedHeight(44)
+        self.view3d_btn.setMinimumWidth(120)
         self.view3d_btn.setStyleSheet(
-            "background:#ffc107;font-weight:bold;font-size:14px;border-radius:5px;")
+            "background:#ffc107;font-weight:bold;font-size:16px;border-radius:8px;border:none;padding:8px 16px;")
         btn_col.addWidget(self.view3d_btn)
         btn_col.addStretch()
+        """
+        btn_col=QVBoxLayout()
+        self.view3d_btn=QPushButton("查看3D模型")
+        self.view3d_btn.setEnabled(False)
+        self.view3d_btn.setToolTip("心功能分析完成后可查看3D动态模型")
+        self.view3d_btn.setFixedHeight(44)
+        self.view3d_btn.setMinimumWidth(120)
+        self.view3d_btn.setStyleSheet(
+            "background:#ffc107;font-weight:bold;font-size:16px;border-radius:8px;border:none;padding:8px 16px;")
+        btn_col.addWidget(self.view3d_btn)
+
+        self.flow2ch_btn = QPushButton("2CH 光流")
+        self.flow2ch_btn.setFixedHeight(40)
+        self.flow2ch_btn.setMinimumWidth(120)
+        btn_col.addWidget(self.flow2ch_btn)
+
+        self.flow4ch_btn = QPushButton("4CH 光流")
+        self.flow4ch_btn.setFixedHeight(40)
+        self.flow4ch_btn.setMinimumWidth(120)
+        btn_col.addWidget(self.flow4ch_btn)
+
+        btn_col.addStretch()
+        
+
+
 
         data_lay.addLayout(metrics_lay,stretch=2)
         data_lay.addStretch()
@@ -1191,6 +1492,10 @@ class MainWindow(QMainWindow):
         self.file4ch_btn.clicked.connect(lambda: self._pick_file("4ch"))
         self.upload_btn.clicked.connect(self._start_analysis)
         self.view3d_btn.clicked.connect(self._open_3d_viewer)
+        
+        self.flow2ch_btn.clicked.connect(self._open_2ch_optical_flow)
+        self.flow4ch_btn.clicked.connect(self._open_4ch_optical_flow)
+        
         self._on_algo_changed(0)
 
     #历史 Tab
@@ -1228,7 +1533,7 @@ class MainWindow(QMainWindow):
         right_lay.addWidget(self.patient_info_lbl)
 
         trend_grp=QGroupBox("历史趋势图")
-        trend_grp.setFont(QFont("Arial",12,QFont.Bold))
+        trend_grp.setFont(QFont("Microsoft YaHei",12,QFont.Bold))
         trend_inner=QVBoxLayout()
         trend_inner.setContentsMargins(8,8,8,8)
         self.trend_canvas=TrendCanvas()
@@ -1238,7 +1543,7 @@ class MainWindow(QMainWindow):
         right_lay.addWidget(trend_grp,stretch=2)
 
         rec_grp=QGroupBox("所有记录")
-        rec_grp.setFont(QFont("Arial",12,QFont.Bold))
+        rec_grp.setFont(QFont("Microsoft YaHei",12,QFont.Bold))
         rec_inner=QVBoxLayout()
         self.record_table=QTableWidget()
         self.record_table.setColumnCount(9)                      
@@ -1263,6 +1568,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _style_file_label(lbl: QLabel):
         lbl.setAlignment(Qt.AlignCenter)
+        lbl.setMinimumHeight(28)
         lbl.setStyleSheet(
             "background:#f8f9fa;border:1px solid #ddd;padding:5px;color:#666;")
 
@@ -1271,16 +1577,82 @@ class MainWindow(QMainWindow):
         needs2,needs4=ALGO_NEEDS.get(algo,(True,True))
         self.file2ch_btn.setEnabled(needs2)
         self.file4ch_btn.setEnabled(needs4)
-        self.file2ch_btn.setStyleSheet("" if needs2 else "background:#cccccc;color:#888;")
-        self.file4ch_btn.setStyleSheet("" if needs4 else "background:#cccccc;color:#888;")
+        # 设置按钮样式 - 保持字体大小一致
+        btn_style_normal = "font-size:16px;font-weight:800;"
+        btn_style_disabled = "background:#cccccc;color:#888;font-size:16px;font-weight:800;"
+        self.file2ch_btn.setStyleSheet(btn_style_normal if needs2 else btn_style_disabled)
+        self.file4ch_btn.setStyleSheet(btn_style_normal if needs4 else btn_style_disabled)
+        # 处理2CH按钮标签状态
         if not needs2:
             self.file_2ch_path=None
             self.file2ch_label.setText("不需要")
+        else:
+            # 如果需要但当前显示"不需要"，重置为"未选择"
+            if self.file2ch_label.text() == "不需要":
+                self.file2ch_label.setText("未选择")
+        # 处理4CH按钮标签状态
         if not needs4:
             self.file_4ch_path=None
             self.file4ch_label.setText("不需要")
+        else:
+            # 如果需要但当前显示"不需要"，重置为"未选择"
+            if self.file4ch_label.text() == "不需要":
+                self.file4ch_label.setText("未选择")
 
+    def _on_auto_detect_toggle(self,checked):
+        """切换自动检测模式"""
+        if checked:
+            self.auto_detect_checkbox.setText("自动检测视图类型(已开启)")
+            self.detect_view_btn.setEnabled(True)
+            # 清除之前的选择
+            self.file_2ch_path=None
+            self.file_4ch_path=None
+            self.file2ch_label.setText("将由AI自动识别")
+            self.file2ch_label.setStyleSheet(
+                "color:#0078D4;background:#e7f3ff;border:1px solid #b4d7ff;padding:5px;")
+            self.file4ch_label.setText("将由AI自动识别")
+            self.file4ch_label.setStyleSheet(
+                "color:#0078D4;background:#e7f3ff;border:1px solid #b4d7ff;padding:5px;")
+            # 存储用户选择的原始文件
+            self._auto_detect_files=[]
+        else:
+            self.auto_detect_checkbox.setText("自动检测视图类型")
+            self.detect_view_btn.setEnabled(False)
+            self.detect_result_label.setText("")
+            self.file2ch_label.setText("未选择")
+            self.file2ch_label.setStyleSheet(
+                "background:#f8f9fa;border:1px solid #ddd;padding:5px;color:#666;")
+            self.file4ch_label.setText("未选择")
+            self.file4ch_label.setStyleSheet(
+                "background:#f8f9fa;border:1px solid #ddd;padding:5px;color:#666;")
+            self._auto_detect_files=[]
+            # 清除累积的检测结果
+            if hasattr(self, '_last_detect_result'):
+                self._last_detect_result=None
+    
     def _pick_file(self,view: str):
+        # 自动检测模式下，允许选择多个文件
+        if hasattr(self, 'auto_detect_checkbox') and self.auto_detect_checkbox.isChecked():
+            paths,_=QFileDialog.getOpenFileNames(
+                self,
+                "选择影像文件（可多选）",
+                "",
+                f"{ALL_IMG_FILTER};;{NIFTI_FILTER};;{DICOM_FILTER};;{VIDEO_FILTER}"
+            )
+            if not paths:
+                return
+            
+            self._auto_detect_files=paths
+            
+            # 显示选择的文件
+            file_names=[os.path.basename(p) for p in paths]
+            self.detect_result_label.setText(f"已选择 {len(paths)} 个文件: {', '.join(file_names)}")
+            
+            # 自动触发检测
+            self._detect_views(paths)
+            return
+        
+        # 传统模式
         path,_=QFileDialog.getOpenFileName(
             self,
             "选择影像文件",
@@ -1304,17 +1676,165 @@ class MainWindow(QMainWindow):
             self.file_4ch_path=path
             self.file4ch_label.setText(f"✓ {fname}")
             self.file4ch_label.setStyleSheet(style_ok)
+    
+    def _detect_views(self,paths: list):
+        """调用后端 API 检测视图类型"""
+        if not paths:
+            return
+        
+        self.detect_result_label.setText("正在检测视图类型...")
+        QApplication.processEvents()
+        
+        try:
+            files=[]
+            for p in paths:
+                files.append(('files', (os.path.basename(p), open(p, 'rb'))))
+            
+            headers={"Authorization": f"Bearer {self.token}"}
+            resp=requests.post(
+                f"{BASE_URL}/detect_view_batch",
+                files=files,
+                data={'auto_assign': 'true', 'threshold': '0.7'},
+                headers=headers,
+                timeout=60
+            )
+            
+            # 关闭文件句柄
+            for _, (_, f) in files:
+                try:
+                    f.close()
+                except:
+                    pass
+            
+            if resp.status_code != 200:
+                self.detect_result_label.setText(f"❌ 检测失败: {resp.text}")
+                return
+            
+            data=resp.json()
+            classifications=data.get('classifications',[])
+            assigned=data.get('assigned',{})
+            warnings=data.get('warnings',[])
+            
+            # 保存检测结果供后续使用（同一视图类型替换旧结果）
+            if not hasattr(self, '_last_detect_result') or not self._last_detect_result:
+                self._last_detect_result={
+                    'classifications': [],
+                    'assigned': {},
+                    'files': {}
+                }
+            
+            # 移除旧的同类型分类结果（避免重复）
+            for c in classifications:
+                view_type = c.get('view_type', 'unknown')
+                # 过滤掉旧的同类型结果
+                self._last_detect_result['classifications'] = [
+                    old for old in self._last_detect_result['classifications']
+                    if old.get('view_type') != view_type
+                ]
+            
+            # 添加新结果
+            self._last_detect_result['classifications'].extend(classifications)
+            # 更新分配结果
+            self._last_detect_result['assigned'].update(assigned)
+            
+            # 根据检测结果设置文件路径
+            result_text=[]
+            for c in classifications:
+                view_type=c.get('view_type','unknown')
+                fname=c.get('filename','')
+                conf=c.get('confidence',0)
+                reliable=c.get('is_reliable',False)
+                
+                status="✓" if reliable else "⚠"
+                emoji={"2ch": "💚", "4ch": "💙", "unknown": "❓"}.get(view_type, "❓")
+                result_text.append(f"{emoji} {fname}: {view_type.upper()} ({conf:.0%})")
+                
+                # 记录到文件映射
+                original_path=None
+                for p in paths:
+                    if os.path.basename(p)==fname:
+                        original_path=p
+                        break
+                
+                if view_type=='2ch' and reliable:
+                    self.file_2ch_path=original_path
+                    self.file2ch_label.setText(f"✓ 已识别: {fname}")
+                    self.file2ch_label.setStyleSheet(
+                        "color:green;background:#e6fffa;border:1px solid #c3e6cb;padding:5px;font-weight:bold;")
+                    self._last_detect_result['files']['2ch']=original_path
+                    
+                elif view_type=='4ch' and reliable:
+                    self.file_4ch_path=original_path
+                    self.file4ch_label.setText(f"✓ 已识别: {fname}")
+                    self.file4ch_label.setStyleSheet(
+                        "color:green;background:#e6fffa;border:1px solid #c3e6cb;padding:5px;font-weight:bold;")
+                    self._last_detect_result['files']['4ch']=original_path
+            
+            # 显示警告
+            if warnings:
+                result_text.append("")
+                result_text.append("⚠ 警告:")
+                for w in warnings:
+                    result_text.append(f"  • {w}")
+            
+            self.detect_result_label.setText("\n".join(result_text))
+            
+        except Exception as e:
+            self.detect_result_label.setText(f"❌ 检测出错: {e}")
+    
+    def _show_detect_result(self):
+        """显示详细的检测结果"""
+        if not hasattr(self,'_last_detect_result') or not self._last_detect_result:
+            QMessageBox.information(self,"检测结果","请先选择文件进行检测")
+            return
+        
+        classifications=self._last_detect_result.get('classifications',[])
+        assigned=self._last_detect_result.get('assigned',{})
+        
+        msg=[]
+        msg.append("=== 视图检测结果 ===\n")
+        
+        for c in classifications:
+            msg.append(f"文件: {c.get('filename','')}")
+            msg.append(f"  识别结果: {c.get('view_type','unknown').upper()}")
+            msg.append(f"  置信度: {c.get('confidence',0):.2%}")
+            msg.append(f"  是否可靠: {'是' if c.get('is_reliable') else '否'}")
+            msg.append("")
+        
+        if assigned:
+            msg.append("=== 自动分配 ===")
+            if '2ch' in assigned:
+                msg.append(f"2CH: {assigned['2ch'].get('filename','')}")
+            if '4ch' in assigned:
+                msg.append(f"4CH: {assigned['4ch'].get('filename','')}")
+        
+        QMessageBox.information(self,"检测详情","\n".join(msg))
 
     def _start_analysis(self):
         algo=self.algo_combo.currentData()
         needs2,needs4=ALGO_NEEDS.get(algo,(True,True))
-
-        if needs2 and not self.file_2ch_path:
-            QMessageBox.warning(self,"提示","当前算法需要 2CH 文件，请先选择")
-            return
-        if needs4 and not self.file_4ch_path:
-            QMessageBox.warning(self,"提示","当前算法需要 4CH 文件，请先选择")
-            return
+        
+        # 自动检测模式检查
+        auto_mode=hasattr(self,'auto_detect_checkbox') and self.auto_detect_checkbox.isChecked()
+        
+        if auto_mode:
+            # 自动检测模式：检查是否有文件
+            if not hasattr(self,'_auto_detect_files') or not self._auto_detect_files:
+                QMessageBox.warning(self,"提示","请先选择要自动识别的影像文件")
+                return
+            # 确保已完成视图检测
+            if not hasattr(self,'_last_detect_result') or not self._last_detect_result:
+                QMessageBox.warning(self,"提示","正在进行视图检测，请稍候...")
+                return
+        else:
+            # 传统模式检查
+            if needs2 and not self.file_2ch_path:
+                QMessageBox.warning(self,"提示","当前算法需要 2CH 文件，请先选择")
+                return
+            if needs4 and not self.file_4ch_path:
+                QMessageBox.warning(self,"提示","当前算法需要 4CH 文件，请先选择")
+                return
+                
         if not self.name_input.text().strip():
             QMessageBox.warning(self,"提示","请输入患者姓名")
             return
@@ -1335,13 +1855,16 @@ class MainWindow(QMainWindow):
         }
 
         #← 读取用户选择的瓣环策略
-        annulus_strategy=self.strategy_combo.currentData()
+        annulus_strategy="auto"  # 固定为自动检测
 
+        # 创建worker，自动检测模式下使用检测结果
         self.worker=AnalysisWorker(
             self.token,
             self.file_2ch_path if needs2 else None,
             self.file_4ch_path if needs4 else None,
-            patient_data,algo,annulus_strategy,BASE_URL
+            patient_data,algo,annulus_strategy,BASE_URL,
+            auto_detect=auto_mode,
+            auto_detect_result=getattr(self,'_last_detect_result',None)
         )
         self.worker.progress_updated.connect(self._update_progress)
         self.worker.analysis_finished.connect(self._on_analysis_finished)
@@ -1353,6 +1876,7 @@ class MainWindow(QMainWindow):
         self.status_lbl.setText(txt)
 
     def _on_analysis_finished(self,result):
+        self.last_result = result
         self.upload_btn.setEnabled(True)
         self.status_lbl.setText("分析完成！")
 
@@ -1366,8 +1890,7 @@ class MainWindow(QMainWindow):
         self.algo_result_lbl.setText(algo_label)
 
         #← 显示实际使用的瓣环策略
-        strat=result.get('annulus_strategy','--')
-        self.strategy_result_lbl.setText(HistoryDetailDialog._translate_strategy(strat))
+
 
         #LVEF 状态颜色
         if lvef >= 50:
@@ -1414,9 +1937,49 @@ class MainWindow(QMainWindow):
     def _on_analysis_error(self,msg):
         self.upload_btn.setEnabled(True)
         QMessageBox.critical(self,"错误",msg)
-
+            
+            
+    def _open_2ch_optical_flow(self):
+        if not self.file_2ch_path:
+            QMessageBox.information(self, "提示", "当前没有可用的 2CH 输入文件。")
+            return
+        if not hasattr(self, "last_result"):
+            QMessageBox.information(self, "提示", "请先完成分析")
+            return
+        mask_url = self.last_result.get("mask_path_2ch")
+        if not mask_url:
+            QMessageBox.information(self, "提示", "没有找到2CH分割结果")
+            return
+        try:
+            mask_path = self._ensure_local_mask_file(mask_url)
+            launch_optical_flow(self, self.file_2ch_path, "2CH 光流追踪", mask_path=mask_path)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"2CH 光流显示失败: {e}")
+        
+    
+    def _open_4ch_optical_flow(self):
+        if not self.file_4ch_path:
+            QMessageBox.information(self, "提示", "当前没有可用的 4CH 输入文件。")
+            return
+        if not hasattr(self, "last_result"):
+            QMessageBox.information(self, "提示", "请先完成分析")
+            return
+        mask_url = self.last_result.get("mask_path_4ch")
+        if not mask_url:
+            QMessageBox.information(self, "提示", "没有找到4CH分割结果")
+            return
+        try:
+            mask_path = self._ensure_local_mask_file(mask_url)
+            launch_optical_flow(self, self.file_4ch_path, "4CH 光流追踪", mask_path=mask_path)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"4CH 光流显示失败: {e}")
+            
+    
     def _open_3d_viewer(self):
         if not self.mesh_series:
+            QMessageBox.information(self,"提示",
+                "暂无3D重建数据。\n\n"
+                "请完成心功能分析后查看3D模型。")
             return
         try:
             self.viewer_window=LV3DViewerWindow(self.mesh_series,self)
@@ -1543,6 +2106,9 @@ if __name__ == "__main__":
             Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app=QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    ICON_PATH = get_resource_path("ui_res/cardiac_icon_bold.png") 
+    app.setWindowIcon(QIcon(ICON_PATH))  
     
     #调用美化后的 LoginDialog，传入背景图路径
     login=LoginDialog(

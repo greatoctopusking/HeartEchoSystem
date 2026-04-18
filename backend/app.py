@@ -23,16 +23,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from functools import wraps
-from flask import Flask,request,jsonify,send_from_directory,Response
+from flask import Flask,request,jsonify,send_from_directory,Response, abort, send_file
 from werkzeug.utils import secure_filename
 
 from config import *
 from model_infer import run_inference
 from biplane_simpson_clinical import BiplaneSimpsonClinical,ALGORITHM_LABELS
 
+# 视图自动分类器
+from inference.view_classifier import classify_view, auto_assign_views, init_classifier
+
 #视频处理
 import cv2
 from scipy.ndimage import label
+
 
 UPLOAD_FOLDER="uploads"
 RESULT_FOLDER="results"
@@ -135,9 +139,16 @@ def token_required(f):
         if not token:
             return jsonify({"error":"Token missing"}),401
         try:
+            # 尝试 JWT 验证
             jwt.decode(token,SECRET_KEY,algorithms=["HS256"])
-        except Exception:
-            return jsonify({"error":"Invalid token"}),401
+        except:
+            # 兼容旧版 UUID token（本地测试模式）
+            # UUID 格式：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+            if len(token) == 36 and token.count('-') == 4:
+                # 认为是有效的 UUID token，放行
+                pass
+            else:
+                return jsonify({"error":"Invalid token"}),401
         return f(*args,**kwargs)
     return decorated
 
@@ -335,101 +346,6 @@ def video_to_nifti(path:str,out_path:str,max_frames:int=80):
     return out_path,spacing
 
 
-
-def video_to_nifti0(path:str,out_path:str,max_frames:int=80):
-    """
-    将视频转换为 NIfTI (H,W,T)。
-    对普通视频文件默认 spacing=(1.0,1.0)。
-
-    优化：
-    - 若视频帧数过多，则均匀采样到 max_frames 帧，减少 nnUNet 推理耗时。
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"视频文件不存在:{path}")
-
-    cap=cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise ValueError(f"无法打开视频文件:{path}")
-
-    frames=[]
-    try:
-        while True:
-            ret,frame=cap.read()
-            if not ret:
-                break
-
-            if frame is None:
-                continue
-
-            if frame.ndim == 2:
-                gray=frame
-            elif frame.ndim == 3:
-                gray=cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
-            else:
-                continue
-
-            gray=_crop_to_ultrasound_content(gray)
-            gray=_normalize_ultrasound_image(gray)
-            frames.append(gray.astype(np.float32))
-    finally:
-        cap.release()
-
-    if not frames:
-        raise ValueError("无法读取视频内容，未提取到有效帧")
-
-    #限帧：视频太长时，均匀采样
-    total_frames=len(frames)
-    if max_frames is not None and total_frames > max_frames:
-        sample_idx=np.linspace(0,total_frames - 1,max_frames).astype(int)
-        frames=[frames[i] for i in sample_idx]
-        print(f"[INFO] 视频原始帧数={total_frames}，已均匀采样到 {len(frames)} 帧")
-    else:
-        print(f"[INFO] 视频帧数={total_frames}，无需采样")
-
-    h0,w0=frames[0].shape
-    aligned_frames=[]
-    for fr in frames:
-        if fr.shape != (h0,w0):
-            fr=cv2.resize(fr,(w0,h0),interpolation=cv2.INTER_LINEAR)
-        aligned_frames.append(fr.astype(np.float32))
-
-    data=np.stack(aligned_frames,axis=-1)
-
-    spacing=(1.0,1.0)
-    affine=np.diag([spacing[0],spacing[1],1.0,1.0])
-
-    img=nib.Nifti1Image(data,affine)
-    img.header.set_zooms((*spacing,1.0))
-    nib.save(img,out_path)
-
-    return out_path,spacing
-
-
-def save_upload0(fileobj,dest_dir:str,prefix:str=""):
-    filename=secure_filename(fileobj.filename or "")
-    if not filename:
-        raise ValueError("上传文件名为空")
-
-    #兼容 .nii.gz 的简单后缀检查
-    lower_name=filename.lower()
-    if not any(lower_name.endswith(ext) for ext in SUPPORTED_EXT):
-        raise ValueError(f"不支持的文件类型:{filename}")
-
-    raw_path=os.path.join(dest_dir,prefix + filename)
-    fileobj.save(raw_path)
-
-    if _is_dicom(raw_path):
-        nii_path=raw_path + "_converted.nii.gz"
-        _,spacing=dicom_to_nifti(raw_path,nii_path)
-        return nii_path,spacing
-
-    if _is_video(raw_path):
-        nii_path=raw_path + "_converted.nii.gz"
-        _,spacing=video_to_nifti(raw_path,nii_path)
-        return nii_path,spacing
-
-    return raw_path,None
-
 def save_upload(fileobj,dest_dir:str,prefix:str=""):
     filename=secure_filename(fileobj.filename or "")
     if not filename:
@@ -609,6 +525,7 @@ def _save_single_frame_overlay(
     fig,ax=plt.subplots(1,1,figsize=(6,6))
     fig.patch.set_facecolor('#111111')
 
+    # 正常绘制（心尖朝下）
     if bg is not None:
         ax.imshow(bg.T,cmap='gray',origin='lower')
 
@@ -621,21 +538,7 @@ def _save_single_frame_overlay(
         cmap='Reds',alpha=0.50,origin='lower'
     )
 
-    #可选：取消注释即可显示
-    """
-    lv_wall=(int_mask == 2).astype(np.uint8)
-    ax.imshow(
-        np.ma.masked_where(lv_wall.T == 0,lv_wall.T),
-        cmap='Blues',alpha=0.35,origin='lower'
-    )
-
-    la_mask=(int_mask == 3).astype(np.uint8)
-    ax.imshow(
-        np.ma.masked_where(la_mask.T == 0,la_mask.T),
-        cmap='Greens',alpha=0.35,origin='lower'
-    )
-    """
-        # 左心肌 LVWall(label=2) -> 半透明红色
+    # 左心肌 LVWall(label=2) -> 半透明红色
     lv_wall=(int_mask == 2)
     if np.any(lv_wall):
         wall_rgba=np.zeros((lv_wall.T.shape[0],lv_wall.T.shape[1],4),dtype=np.float32)
@@ -666,6 +569,9 @@ def _save_single_frame_overlay(
         annulus_mid_mm=annulus_mid_mm,
     )
 
+    # 整体翻转Y轴，使心尖朝上
+    ax.invert_yaxis()
+
     ax.set_title(
         f"{view_name} frame {frame_i}",
         color='white',fontsize=12,fontweight='bold',pad=8
@@ -681,6 +587,90 @@ def _save_single_frame_overlay(
     )
     plt.close(fig)
 
+def _interp_series_np(arr, target_len):
+    arr = np.asarray(arr, dtype=float)
+    src_len = arr.shape[0]
+
+    if src_len == 0:
+        return arr
+    if src_len == target_len:
+        return arr.copy()
+    if src_len == 1:
+        return np.repeat(arr, target_len, axis=0)
+
+    x_old = np.linspace(0.0, 1.0, src_len)
+    x_new = np.linspace(0.0, 1.0, target_len)
+
+    flat = arr.reshape(src_len, -1)
+    out = np.zeros((target_len, flat.shape[1]), dtype=float)
+
+    for j in range(flat.shape[1]):
+        out[:, j] = np.interp(x_new, x_old, flat[:, j])
+
+    return out.reshape((target_len,) + arr.shape[1:])
+
+
+def _smooth_frame_infos(frame_infos, target_frames=80, smooth_sigma=1.0):
+    if not frame_infos:
+        return []
+
+    if len(frame_infos) == 1:
+        return [frame_infos[0]] * target_frames
+
+    bounds_2ch = np.array([x["bounds_2ch"] for x in frame_infos], dtype=float)
+    bounds_4ch = np.array([x["bounds_4ch"] for x in frame_infos], dtype=float)
+    h_mm = np.array([x["h_mm"] for x in frame_infos], dtype=float)
+
+    origin_2ch_mm = np.array([
+        x["origin_2ch_mm"] if x.get("origin_2ch_mm") is not None else [0.0, 0.0]
+        for x in frame_infos
+    ], dtype=float)
+
+    axis_u_2ch = np.array([
+        x["axis_u_2ch"] if x.get("axis_u_2ch") is not None else [0.0, 1.0]
+        for x in frame_infos
+    ], dtype=float)
+
+    bounds_2ch = _interp_series_np(bounds_2ch, target_frames)
+    bounds_4ch = _interp_series_np(bounds_4ch, target_frames)
+    h_mm = _interp_series_np(h_mm, target_frames)
+    origin_2ch_mm = _interp_series_np(origin_2ch_mm, target_frames)
+    axis_u_2ch = _interp_series_np(axis_u_2ch, target_frames)
+
+    if smooth_sigma > 0:
+        radius = max(1, int(round(smooth_sigma * 3)))
+        xs = np.arange(-radius, radius + 1, dtype=float)
+        kernel = np.exp(-(xs * xs) / (2.0 * smooth_sigma * smooth_sigma))
+        kernel /= kernel.sum()
+
+        def _smooth_last_dims(arr):
+            arr = np.asarray(arr, dtype=float)
+            flat = arr.reshape(arr.shape[0], -1)
+            out = np.zeros_like(flat)
+            for col in range(flat.shape[1]):
+                padded = np.pad(flat[:, col], (radius, radius), mode="edge")
+                out[:, col] = np.convolve(padded, kernel, mode="valid")
+            return out.reshape(arr.shape)
+
+        bounds_2ch = _smooth_last_dims(bounds_2ch)
+        bounds_4ch = _smooth_last_dims(bounds_4ch)
+        h_mm = _smooth_last_dims(h_mm)
+        origin_2ch_mm = _smooth_last_dims(origin_2ch_mm)
+        axis_u_2ch = _smooth_last_dims(axis_u_2ch)
+
+    norm = np.linalg.norm(axis_u_2ch, axis=1, keepdims=True) + 1e-12
+    axis_u_2ch = axis_u_2ch / norm
+
+    out = []
+    for i in range(target_frames):
+        out.append({
+            "bounds_2ch": bounds_2ch[i].tolist(),
+            "bounds_4ch": bounds_4ch[i].tolist(),
+            "h_mm": float(max(h_mm[i], 1e-6)),
+            "origin_2ch_mm": origin_2ch_mm[i].tolist(),
+            "axis_u_2ch": axis_u_2ch[i].tolist(),
+        })
+    return out
 
 # 3D Mesh 生成
 def _build_3d_series(calculator,masks2,masks4,spacing2,spacing4,result):
@@ -691,6 +681,11 @@ def _build_3d_series(calculator,masks2,masks4,spacing2,spacing4,result):
 
     T2=len(masks2) if masks2 else 0
     T4=len(masks4) if masks4 else 0
+    
+    # 判断是单平面还是双平面模式
+    has_2ch = T2 > 0
+    has_4ch = T4 > 0
+    is_singleplane = not (has_2ch and has_4ch)
 
     aligned_2ch,aligned_4ch=calculator.align_series_indices(
         ed_2ch,es_2ch,max(T2,1),
@@ -700,61 +695,262 @@ def _build_3d_series(calculator,masks2,masks4,spacing2,spacing4,result):
     if T <= 0:
         return None
 
-    if masks2 and masks4:
-        info_ref=calculator.frame_bounds_and_L(
-            masks2[ed_2ch],masks4[ed_4ch],spacing2,spacing4
-        )
-    else:
-        m2_ref=masks2[aligned_2ch[0]] if masks2 else np.zeros((10,10),dtype=np.int16)
-        m4_ref=masks4[aligned_4ch[0]] if masks4 else np.zeros((10,10),dtype=np.int16)
-        info_ref=calculator.frame_bounds_and_L(m2_ref,m4_ref,spacing2,spacing4)
+    # 安全检查：ED/ES索引
+    if has_2ch and ed_2ch >= len(masks2):
+        print(f"[WARN] 3D: ed_2ch ({ed_2ch}) out of range (masks2 len={len(masks2)}), using 0")
+        ed_2ch = 0
+    if has_4ch and ed_4ch >= len(masks4):
+        print(f"[WARN] 3D: ed_4ch ({ed_4ch}) out of range (masks4 len={len(masks4)}), using 0")
+        ed_4ch = 0
+    
+    # 双平面：使用两个视图；单平面：使用同一个视图作为参考
+    try:
+        if has_2ch and has_4ch:
+            info_ref=calculator.frame_bounds_and_L(
+                masks2[ed_2ch],masks4[ed_4ch],spacing2,spacing4
+            )
+        elif has_2ch:
+            # 只有2CH：用2CH作为参考，构建对称模型
+            info_ref=calculator.frame_bounds_and_L(
+                masks2[ed_2ch],masks2[ed_2ch],spacing2,spacing2
+            )
+        elif has_4ch:
+            # 只有4CH：用4CH作为参考
+            info_ref=calculator.frame_bounds_and_L(
+                masks4[ed_4ch],masks4[ed_4ch],spacing4,spacing4
+            )
+        else:
+            return None
+    except Exception as e:
+        print(f"[WARN] 3D reference frame calculation failed: {e}")
+        return None
 
     origin_ref_2ch=info_ref.get("origin_2ch_mm",None)
     axis_ref_2ch=info_ref.get("axis_u_2ch",None)
 
     if origin_ref_2ch is None or axis_ref_2ch is None:
-        m2_ref0=masks2[aligned_2ch[0]] if masks2 else np.zeros((10,10),dtype=np.int16)
-        m4_ref0=masks4[aligned_4ch[0]] if masks4 else np.zeros((10,10),dtype=np.int16)
-        info_ref0=calculator.frame_bounds_and_L(m2_ref0,m4_ref0,spacing2,spacing4)
+        if has_2ch:
+            m_ref=masks2[aligned_2ch[0]]
+            info_ref0=calculator.frame_bounds_and_L(m_ref,m_ref,spacing2,spacing2)
+        elif has_4ch:
+            m_ref=masks4[aligned_4ch[0]]
+            info_ref0=calculator.frame_bounds_and_L(m_ref,m_ref,spacing4,spacing4)
+        else:
+            return None
         origin_ref_2ch=info_ref0.get("origin_2ch_mm",None)
         axis_ref_2ch=info_ref0.get("axis_u_2ch",None)
+    
+    # 最终检查：如果仍然无法获取参考点和轴，使用默认值
+    if origin_ref_2ch is None:
+        origin_ref_2ch = np.array([0.0, 0.0, 0.0])
+        print("[WARN] 3D: origin_ref_2ch is None, using default [0,0,0]")
+    if axis_ref_2ch is None:
+        axis_ref_2ch = np.array([0.0, -1.0, 0.0])  # 默认朝上
+        print("[WARN] 3D: axis_ref_2ch is None, using default [0,-1,0]")
 
-    m2_0=masks2[aligned_2ch[0]] if masks2 else np.zeros((10,10),dtype=np.int16)
-    m4_0=masks4[aligned_4ch[0]] if masks4 else np.zeros((10,10),dtype=np.int16)
-    info0=calculator.frame_bounds_and_L(m2_0,m4_0,spacing2,spacing4)
-    if info0["bounds_2ch"] is None or info0["bounds_4ch"] is None:
+    # 获取参考帧的bounds
+    if has_2ch:
+        m_ref_0=masks2[aligned_2ch[0]]
+        info0=calculator.frame_bounds_and_L(m_ref_0,m_ref_0,spacing2,spacing2)
+    elif has_4ch:
+        m_ref_0=masks4[aligned_4ch[0]]
+        info0=calculator.frame_bounds_and_L(m_ref_0,m_ref_0,spacing4,spacing4)
+    else:
+        return None
+    
+    # 单平面模式下，允许只有bounds_2ch或bounds_4ch
+    b2ch_ref = info0.get("bounds_2ch")
+    b4ch_ref = info0.get("bounds_4ch")
+    h_mm_ref = info0.get("h_mm", 0)
+    
+    if b2ch_ref is None:
+        print("[WARN] 3D: bounds_2ch is None, skip 3D generation")
+        return None
+    
+    # 单平面时，如果没有bounds_4ch，用bounds_2ch替代
+    if b4ch_ref is None:
+        b4ch_ref = b2ch_ref
+    
+    # 确保h_mm有效
+    if h_mm_ref <= 1e-6:
+        print(f"[WARN] 3D: h_mm too small ({h_mm_ref}), skip 3D generation")
         return None
 
-    _,f0=calculator.generate_3d_mesh_asymmetric(
-        info0["bounds_2ch"],info0["bounds_4ch"],info0["h_mm"]
-    )
+    try:
+        verts,f0=calculator.generate_3d_mesh_asymmetric(
+            b2ch_ref, b4ch_ref, h_mm_ref
+        )
+        # 检查结果有效性
+        if verts is None or len(verts) == 0:
+            print("[WARN] 3D mesh generation returned empty vertices")
+            return None
+        if f0 is None or len(f0) == 0:
+            print("[WARN] 3D mesh generation returned empty faces")
+            return None
+    except Exception as e:
+        print(f"[WARN] 3D mesh generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
     faces_list=np.asarray(f0,dtype=int).tolist()
+    
+    
+    frame_infos = []
+    for t_idx in range(T):
+        if has_2ch and t_idx >= len(aligned_2ch):
+            print(f"[WARN] 3D: aligned_2ch index out of range: {t_idx} >= {len(aligned_2ch)}")
+            continue
+        if has_4ch and t_idx >= len(aligned_4ch):
+            print(f"[WARN] 3D: aligned_4ch index out of range: {t_idx} >= {len(aligned_4ch)}")
+            continue
 
+        idx2 = aligned_2ch[t_idx] if has_2ch else 0
+        idx4 = aligned_4ch[t_idx] if has_4ch else 0
+
+        if has_2ch and idx2 >= len(masks2):
+            print(f"[WARN] 3D: masks2 index out of range: {idx2} >= {len(masks2)}")
+            continue
+        if has_4ch and idx4 >= len(masks4):
+            print(f"[WARN] 3D: masks4 index out of range: {idx4} >= {len(masks4)}")
+            continue
+
+        try:
+            if has_2ch and has_4ch:
+                m2 = masks2[idx2]
+                m4 = masks4[idx4]
+                info = calculator.frame_bounds_and_L(m2, m4, spacing2, spacing4)
+                b2ch = info.get("bounds_2ch")
+                b4ch = info.get("bounds_4ch")
+            elif has_2ch:
+                m = masks2[idx2]
+                info = calculator.frame_bounds_and_L(m, m, spacing2, spacing2)
+                b2ch = info.get("bounds_2ch")
+                b4ch = b2ch
+            elif has_4ch:
+                m = masks4[idx4]
+                info = calculator.frame_bounds_and_L(m, m, spacing4, spacing4)
+                b4ch = info.get("bounds_4ch")
+                b2ch = b4ch
+            else:
+                continue
+
+            h_mm = info.get("h_mm", 0)
+
+            if b2ch is None or b4ch is None or h_mm <= 1e-6:
+                continue
+
+            frame_infos.append({
+                "bounds_2ch": b2ch,
+                "bounds_4ch": b4ch,
+                "h_mm": h_mm,
+                "origin_2ch_mm": origin_ref_2ch,
+                "axis_u_2ch": axis_ref_2ch,
+            })
+        except Exception as e:
+            print(f"[WARN] 3D frame info {t_idx} extraction failed: {e}")
+            continue
+
+    if not frame_infos:
+        return None
+
+    target_frames = max(len(frame_infos), 80 if len(frame_infos) < 80 else len(frame_infos))
+    smooth_infos = _smooth_frame_infos(
+        frame_infos,
+        target_frames=target_frames,
+        smooth_sigma=1.0
+    )
+
+    vertices_series = []
+    for t_idx, info in enumerate(smooth_infos):
+        try:
+            v, _ = calculator.generate_3d_mesh_asymmetric(
+                info["bounds_2ch"],
+                info["bounds_4ch"],
+                info["h_mm"],
+                origin_2ch_mm=info["origin_2ch_mm"],
+                axis_u_2ch=info["axis_u_2ch"]
+            )
+            vertices_series.append(np.asarray(v, dtype=float).tolist())
+        except Exception as e:
+            print(f"[WARN] 3D smoothed frame {t_idx} generation failed: {e}")
+            vertices_series.append(
+                vertices_series[-1] if vertices_series
+                else np.zeros((calculator.n*32,3)).tolist()
+            )
+    """
     vertices_series=[]
     for t_idx in range(T):
-        idx2=aligned_2ch[t_idx] if masks2 else 0
-        idx4=aligned_4ch[t_idx] if masks4 else 0
-        m2=masks2[idx2] if masks2 else np.zeros((10,10),dtype=np.int16)
-        m4=masks4[idx4] if masks4 else np.zeros((10,10),dtype=np.int16)
-
-        info=calculator.frame_bounds_and_L(m2,m4,spacing2,spacing4)
-        if (info["bounds_2ch"] is None or info["bounds_4ch"] is None
-                or info["h_mm"] <= 1e-6):
+        # 安全检查：确保索引在有效范围内
+        if has_2ch and t_idx >= len(aligned_2ch):
+            print(f"[WARN] 3D: aligned_2ch index out of range: {t_idx} >= {len(aligned_2ch)}")
+            continue
+        if has_4ch and t_idx >= len(aligned_4ch):
+            print(f"[WARN] 3D: aligned_4ch index out of range: {t_idx} >= {len(aligned_4ch)}")
+            continue
+            
+        idx2=aligned_2ch[t_idx] if has_2ch else 0
+        idx4=aligned_4ch[t_idx] if has_4ch else 0
+        
+        # 再检查索引是否在masks范围内
+        if has_2ch and idx2 >= len(masks2):
+            print(f"[WARN] 3D: masks2 index out of range: {idx2} >= {len(masks2)}")
+            continue
+        if has_4ch and idx4 >= len(masks4):
+            print(f"[WARN] 3D: masks4 index out of range: {idx4} >= {len(masks4)}")
+            continue
+        
+        # 单平面模式：使用同一个视图的 bounds 作为两个平面的输入
+        if has_2ch and has_4ch:
+            # 双平面模式
+            m2=masks2[idx2]
+            m4=masks4[idx4]
+            info=calculator.frame_bounds_and_L(m2,m4,spacing2,spacing4)
+            b2ch=info.get("bounds_2ch")
+            b4ch=info.get("bounds_4ch")
+        elif has_2ch:
+            # 单平面2CH：用2CH bounds 作为两个平面的输入（构建对称椭球）
+            m=masks2[idx2]
+            info=calculator.frame_bounds_and_L(m,m,spacing2,spacing2)
+            b2ch=info.get("bounds_2ch")
+            b4ch=b2ch  # 单平面时两个平面用相同的bounds
+        elif has_4ch:
+            # 单平面4CH
+            m=masks4[idx4]
+            info=calculator.frame_bounds_and_L(m,m,spacing4,spacing4)
+            b4ch=info.get("bounds_4ch")
+            b2ch=b4ch  # 单平面时两个平面用相同的bounds
+        else:
+            vertices_series.append(
+                vertices_series[-1] if vertices_series
+                else np.zeros((calculator.n*32,3)).tolist()
+            )
+            continue
+        
+        h_mm=info.get("h_mm",0)
+        
+        if (b2ch is None or b4ch is None or h_mm <= 1e-6):
             vertices_series.append(
                 vertices_series[-1] if vertices_series
                 else np.zeros((calculator.n*32,3)).tolist()
             )
             continue
 
-        v,_=calculator.generate_3d_mesh_asymmetric(
-            info["bounds_2ch"],
-            info["bounds_4ch"],
-            info["h_mm"],
-            origin_2ch_mm=origin_ref_2ch,
-            axis_u_2ch=axis_ref_2ch
-        )
-        vertices_series.append(np.asarray(v,dtype=float).tolist())
-
+        try:
+            v,_=calculator.generate_3d_mesh_asymmetric(
+                b2ch,b4ch,h_mm,
+                origin_2ch_mm=origin_ref_2ch,
+                axis_u_2ch=axis_ref_2ch
+            )
+            vertices_series.append(np.asarray(v,dtype=float).tolist())
+        except Exception as e:
+            print(f"[WARN] 3D frame {t_idx} generation failed: {e}")
+            # 使用前一帧的数据，或零填充
+            vertices_series.append(
+                vertices_series[-1] if vertices_series
+                else np.zeros((calculator.n*32,3)).tolist()
+            )
+    """
+    
     return {
         "faces":faces_list,
         "vertices_series":vertices_series,
@@ -764,8 +960,6 @@ def _build_3d_series(calculator,masks2,masks4,spacing2,spacing4,result):
     }
 
 
-
-# 流式生成器
 def generate_ndjson_response(
     path2ch,path4ch,patient_data:dict,
     algorithm:str="biplane_simpson",
@@ -776,13 +970,11 @@ def generate_ndjson_response(
 ):
     try:
         yield json.dumps({"progress":5,"status":"文件已保存，读取影像数据..."}) + "\n"
-
         has2=path2ch is not None and os.path.exists(path2ch)
         has4=path4ch is not None and os.path.exists(path4ch)
         if not has2 and not has4:
             yield json.dumps({"error":"至少需要提供一个视图文件"}) + "\n"
             return
-
         needs_2ch=algorithm in ("biplane_simpson","singleplane_2ch","area_length_2ch")
         needs_4ch=algorithm in ("biplane_simpson","singleplane_4ch","area_length_4ch")
         if needs_2ch and not has2:
@@ -791,18 +983,13 @@ def generate_ndjson_response(
         if needs_4ch and not has4:
             yield json.dumps({"error":f"算法 [{algorithm}] 需要 4CH 文件"}) + "\n"
             return
-
         orig2=nib.load(path2ch) if has2 else None
         orig4=nib.load(path4ch) if has4 else None
         spacing2=spacing2_override or (orig2.header.get_zooms()[:2] if orig2 else (1.0,1.0))
         spacing4=spacing4_override or (orig4.header.get_zooms()[:2] if orig4 else (1.0,1.0))
-
         yield json.dumps({"progress":15,"status":"AI 图像分割（可能需要几分钟）..."}) + "\n"
-
         masks2,masks4=[],[]
-
         if has2:
-            #_,preds2ch=run_inference(path2ch,"case_2ch",NNUNET_DATASET_2CH)
             _,preds2ch=run_inference(
                 path2ch,
                 "case_2ch",
@@ -819,9 +1006,7 @@ def generate_ndjson_response(
                 pass
             for p in preds2ch:
                 masks2.append(nib.load(p).get_fdata())
-
         if has4:
-            #_,preds4ch=run_inference(path4ch,"case_4ch",NNUNET_DATASET_4CH)
             _,preds4ch=run_inference(
                 path4ch,
                 "case_4ch",
@@ -838,21 +1023,13 @@ def generate_ndjson_response(
                 pass
             for p in preds4ch:
                 masks4.append(nib.load(p).get_fdata())
-
         resolved_strategy=_resolve_strategy(annulus_strategy,masks2,masks4)
         print(f"[INFO] annulus_strategy:请求={annulus_strategy} → 实际={resolved_strategy}")
         yield json.dumps({
             "progress":50,
             "status":f"瓣环定位策略：{resolved_strategy}，开始心功能计算..."
         }) + "\n"
-        """
-        calculator=BiplaneSimpsonClinical(
-            n_discs=20,
-            annulus_strategy=resolved_strategy,
-        )
-        """
         use_video_rule=is_video_2ch or is_video_4ch
-
         calculator=BiplaneSimpsonClinical(
             n_discs=20,
             annulus_strategy=resolved_strategy,
@@ -861,17 +1038,13 @@ def generate_ndjson_response(
         
         
         yield json.dumps({"progress":55,"status":"计算心功能参数..."}) + "\n"
-
-        #统一入口：只算一次所有可用算法
         all_results=calculator.compute_all_algorithms(
             masks2,masks4,spacing2,spacing4
         )
-
         result=all_results.get(algorithm)
         if result is None:
             yield json.dumps({"error":f"{algorithm} 计算失败"}) + "\n"
             return
-
         comparison={}
         for key,r in all_results.items():
             if r is not None:
@@ -881,7 +1054,6 @@ def generate_ndjson_response(
                     "EDV":round(r["EDV"],2),
                     "ESV":round(r["ESV"],2),
                 }
-
         yield json.dumps({"progress":65,"status":"3D 网格重建..."}) + "\n"
         mesh_3d_series=None
         try:
@@ -893,12 +1065,10 @@ def generate_ndjson_response(
         except Exception as e:
             print(f"[WARN] 3D failed:{e}")
             traceback.print_exc()
-
         yield json.dumps({"progress":80,"status":"生成结果预览图..."}) + "\n"
         overlay_2ch_file=None
         overlay_4ch_file=None
         ts=datetime.datetime.now().strftime('%Y%m%d%H%M%S')
-
         try:
             ED_i2=int(result['ED_index'])
             ES_i2=int(result['ES_index'])
@@ -906,39 +1076,23 @@ def generate_ndjson_response(
             ES_i4=int(result.get('ES_index_4ch',0))
             orig2_data=orig2.get_fdata() if orig2 else None
             orig4_data=orig4.get_fdata() if orig4 else None
-
-
             def _render_view(view_name,masks_v,orig_v,spacing_v,ed_i,es_i,axis_keys):
                 fig,axs=plt.subplots(1,2,figsize=(12,6))
                 fig.patch.set_facecolor('#111111')
-
                 print(f"[INFO] overlay {view_name}:ED_i={ed_i},ES_i={es_i}")
                 print(f"[INFO] overlay {view_name} mask ED area={int(np.sum(_ensure_int_labels(masks_v[ed_i]) == 1))}")
                 print(f"[INFO] overlay {view_name} mask ES area={int(np.sum(_ensure_int_labels(masks_v[es_i]) == 1))}")
-
                 for ax,(frame_i,phase) in zip(axs,[(ed_i,"ED"),(es_i,"ES")]):
                     mask=masks_v[frame_i]
                     bg=(orig_v[:,:,frame_i] if orig_v is not None and orig_v.ndim == 3 else orig_v)
-
                     if bg is not None:
                         ax.imshow(bg.T,cmap='gray',origin='lower')
-
                     int_mask=_ensure_int_labels(mask)
                     lv_only=(int_mask == 1).astype(np.uint8)
                     ax.imshow(
                         np.ma.masked_where(lv_only.T == 0,lv_only.T),
                         cmap='Reds',alpha=0.5,origin='lower'
                     )
-                    """
-                    #叠加：左心肌/左心房
-                    #左心肌 LVWall（label=2）
-                    lv_wall=(int_mask == 2).astype(np.uint8)
-                    ax.imshow(
-                        np.ma.masked_where(lv_wall.T == 0,lv_wall.T),
-                        cmap='Blues',alpha=0.35,origin='lower'
-                    )
-                    """
-                                        # 左心肌 LVWall(label=2) -> 半透明红色
                     lv_wall=(int_mask == 2)
                     if np.any(lv_wall):
                         wall_rgba=np.zeros((lv_wall.T.shape[0],lv_wall.T.shape[1],4),dtype=np.float32)
@@ -947,8 +1101,6 @@ def generate_ndjson_response(
                         wall_rgba[...,2]=0.0
                         wall_rgba[...,3]=lv_wall.T.astype(np.float32) * 0.35
                         ax.imshow(wall_rgba,origin='lower')
-
-                    # 左心房 LA(label=3) -> 半透明绿色
                     la_mask=(int_mask == 3)
                     if np.any(la_mask):
                         la_rgba=np.zeros((la_mask.T.shape[0],la_mask.T.shape[1],4),dtype=np.float32)
@@ -958,18 +1110,9 @@ def generate_ndjson_response(
                         la_rgba[...,3]=la_mask.T.astype(np.float32) * 0.35
                         ax.imshow(la_rgba,origin='lower')
                     
-                    
-                    #左心房 LA（label=3）
-                    la_mask=(int_mask == 3).astype(np.uint8)
-                    ax.imshow(
-                        np.ma.masked_where(la_mask.T == 0,la_mask.T),
-                        cmap='Greens',alpha=0.35,origin='lower'
-                    )
-                    
                     au_key,ap_key,an_key=(
                         axis_keys[:3] if phase == "ED" else axis_keys[3:]
                     )
-
                     draw_simpson_lines(
                         ax,mask,spacing_v,
                         n_discs=calculator.n,
@@ -979,13 +1122,12 @@ def generate_ndjson_response(
                         apex_mm=result.get(ap_key),
                         annulus_mid_mm=result.get(an_key),
                     )
-
+                    ax.invert_yaxis()
                     ax.set_title(
                         f"{view_name} {phase} frame {frame_i}",
                         color='white',fontsize=13,fontweight='bold',pad=8
                     )
                     ax.axis('off')
-
                 fig.tight_layout(pad=1.5)
                 fname=f"overlay_{view_name.lower()}_{ts}.png"
                 fig.savefig(
@@ -996,7 +1138,7 @@ def generate_ndjson_response(
                 )
                 plt.close(fig)
                 return fname
-            #"""
+            
             if masks2:
                 overlay_2ch_file=_render_view(
                     "2CH",masks2,orig2_data,spacing2,ED_i2,ES_i2,
@@ -1010,27 +1152,19 @@ def generate_ndjson_response(
                      "axis_u_4ch_es","apex_4ch_es","annulus_mid_4ch_es")
                 )
                 
-            video_overlay_dirs={}
-
             def _export_video_overlays(view_name,masks_v,orig_v,spacing_v,result,is_video_view):
                 if not is_video_view or not masks_v:
                     return None
-
                 ts_dir=datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
                 folder_name=f"overlay_frames_{view_name.lower()}_{ts_dir}"
                 folder_path=os.path.join(RESULT_FOLDER,folder_name)
                 os.makedirs(folder_path,exist_ok=True)
-
                 print(f"[INFO] 导出视频 overlay:{view_name},共 {len(masks_v)} 帧 -> {folder_path}")
-
                 axis_prefix=view_name.lower()
-
                 for frame_i in range(len(masks_v)):
                     mask=masks_v[frame_i]
                     bg=(orig_v[:,:,frame_i] if orig_v is not None and orig_v.ndim == 3 else orig_v)
-
                     out_png=os.path.join(folder_path,f"{view_name.lower()}_{frame_i:03d}.png")
-
                     _save_single_frame_overlay(
                         save_path=out_png,
                         view_name=view_name,
@@ -1038,44 +1172,60 @@ def generate_ndjson_response(
                         mask=mask,
                         bg=bg,
                         spacing=spacing_v,
-                        axis_u_override=None,    #全帧排查时先不强绑 ED/ES 的轴
+                        axis_u_override=None,
                         apex_mm=None,
                         annulus_mid_mm=None,
                         n_discs=calculator.n,
                         band_frac=calculator.band_frac,
                         min_band_points=calculator.min_band_points,
                     )
-
-                return folder_name
-            #"""
+                import cv2
+                def frames_to_video(frame_dir, out_path, fps=20):
+                    files = sorted(os.listdir(frame_dir))
+                    files = [f for f in files if f.endswith(".png")]
+                    first = cv2.imread(os.path.join(frame_dir, files[0]))
+                    h, w, _ = first.shape
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+                    for f in files:
+                        img = cv2.imread(os.path.join(frame_dir, f))
+                        writer.write(img)
+                    writer.release()
+                    return out_path
+                
+                video_filename = f"{view_name.lower()}_{ts_dir}.mp4"
+                video_path = os.path.join(RESULT_FOLDER, video_filename)
+                frames_to_video(folder_path, video_path)
+                return folder_name, video_filename
+            
+            video_overlay_dirs={}
             if masks2:
-                folder_2ch=_export_video_overlays(
+                result_2ch=_export_video_overlays(
                     "2CH",masks2,orig2_data,spacing2,result,is_video_2ch
                 )
-                if folder_2ch:
-                    video_overlay_dirs["2ch"]=folder_2ch
-
+                if result_2ch:
+                    folder_2ch, video_2ch = result_2ch
+                    video_overlay_dirs["2ch"] = folder_2ch
+                    video_overlay_dirs["2ch_video"] = video_2ch
             if masks4:
-                folder_4ch=_export_video_overlays(
+                result_4ch=_export_video_overlays(
                     "4CH",masks4,orig4_data,spacing4,result,is_video_4ch
                 )
-                if folder_4ch:
-                    video_overlay_dirs["4ch"]=folder_4ch
-            #"""
-                    
+                if result_4ch:
+                    folder_4ch, video_4ch = result_4ch
+                    video_overlay_dirs["4ch"] = folder_4ch
+                    video_overlay_dirs["4ch_video"] = video_4ch
+                                                    
         except Exception as e:
             print(f"[WARN] Overlay failed:{e}")
             traceback.print_exc()
-
         yield json.dumps({"progress":90,"status":"保存到数据库..."}) + "\n"
         try:
             patient_uid=patient_data.get("patient_uid") or str(uuid.uuid4())[:8].upper()
             conn=get_db()
             cur=conn.cursor()
-
             cur.execute("SELECT id FROM patient WHERE patient_uid=%s",(patient_uid,))
             row=cur.fetchone()
-
             if row:
                 patient_id=row[0]
                 cur.execute(
@@ -1088,7 +1238,6 @@ def generate_ndjson_response(
                     (patient_uid,patient_data.get("name"),patient_data.get("age"),patient_data.get("gender"))
                 )
                 patient_id=cur.lastrowid
-
             overlay_db_path=";".join(filter(None,[overlay_2ch_file,overlay_4ch_file]))
             cur.execute(
                 """INSERT INTO analysis_record
@@ -1111,31 +1260,73 @@ def generate_ndjson_response(
         except Exception as e:
             print(f"[WARN] DB save failed:{e}")
             traceback.print_exc()
-
         yield json.dumps({"progress":100,"status":"分析完成！"}) + "\n"
 
-        resp_data={
-            "LVEF":round(result["EF"],2),
-            "EDV":round(result["EDV"],2),
-            "ESV":round(result["ESV"],2),
-            "algorithm":algorithm,
-            "annulus_strategy":resolved_strategy,
-            "comparison":comparison,
-            "mesh_3d_series":mesh_3d_series,
+        # ===== 修复：先保存 mask，再构造返回值 =====
+        mask_2ch_path = None
+        if masks2:
+            try:
+                mask_2ch_nii = np.stack(masks2, axis=-1).astype(np.float32)
+                #mask_2ch_file = f"mask_2ch_{ts}.nii.gz"
+                mask_2ch_file = f"mask_2ch_{ts}.nii"
+                mask_2ch_path = os.path.join(RESULT_FOLDER, mask_2ch_file)
+                affine = np.eye(4)
+                
+                nib.save(nib.Nifti1Image(mask_2ch_nii, affine), mask_2ch_path)
+                print(f"[INFO] 保存2CH mask: {mask_2ch_path}")
+            except Exception as e:
+                print(f"[WARN] 保存2CH mask失败: {e}")
+
+        mask_4ch_path = None
+        if masks4:
+            try:
+                mask_4ch_nii = np.stack(masks4, axis=-1).astype(np.float32)
+                #mask_4ch_file = f"mask_4ch_{ts}.nii.gz"
+                mask_4ch_file = f"mask_4ch_{ts}.nii"
+                mask_4ch_path = os.path.join(RESULT_FOLDER, mask_4ch_file)
+                affine = np.eye(4)
+                nib.save(nib.Nifti1Image(mask_4ch_nii, affine), mask_4ch_path)
+                print(f"[INFO] 保存4CH mask: {mask_4ch_path}")
+            except Exception as e:
+                print(f"[WARN] 保存4CH mask失败: {e}")
+
+        # ===== 构造最终返回（只写一次）=====
+        resp_data = {
+            "LVEF": round(result["EF"], 2),
+            "EDV": round(result["EDV"], 2),
+            "ESV": round(result["ESV"], 2),
+            "algorithm": algorithm,
+            "annulus_strategy": resolved_strategy,
+            "comparison": comparison,
+            "mesh_3d_series": mesh_3d_series,
+            "mask_path_2ch": f"{BASE_URL}/results/{os.path.basename(mask_2ch_path)}" if mask_2ch_path else None,
+            "mask_path_4ch": f"{BASE_URL}/results/{os.path.basename(mask_4ch_path)}" if mask_4ch_path else None,
         }
+
         if overlay_2ch_file:
             resp_data["overlay_2ch_url"]=f"{BASE_URL}/results/{overlay_2ch_file}"
         if overlay_4ch_file:
             resp_data["overlay_4ch_url"]=f"{BASE_URL}/results/{overlay_4ch_file}"
         if video_overlay_dirs:
-            resp_data["video_overlay_dirs"]={
-                k:f"{BASE_URL}/results/{v}" for k,v in video_overlay_dirs.items()
-            }
+            resp_data["video_overlay_dirs"] = {}
+            for k, v in video_overlay_dirs.items():
+                resp_data["video_overlay_dirs"][k] = f"{BASE_URL}/results/{v}"
+       
         yield json.dumps({"result":resp_data}) + "\n"
-
+        
+        print("[INFO] 分析完成，清理临时文件...")
+        for path in [path2ch, path4ch]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                    print(f"[INFO] 已删除临时文件: {path}")
+                except Exception as e:
+                    print(f"[WARN] 删除临时文件失败 {path}: {e}")
     except Exception as e:
         traceback.print_exc()
         yield json.dumps({"error":str(e)}) + "\n"
+
+
 
 
 # 路由
@@ -1163,15 +1354,243 @@ def login():
         token=token.decode("utf-8")
     return jsonify({"token":token})
 
-
+"""
 @app.route('/results/<path:filename>')
 def serve_results(filename):
     return send_from_directory(RESULT_FOLDER,filename)
+"""
+@app.route('/results/<path:filename>')
+def serve_results(filename):
+    full_path = os.path.join(RESULT_FOLDER, filename)
+    if not os.path.exists(full_path):
+        abort(404)
+
+    lower = filename.lower()
+    if lower.endswith(".nii.gz"):
+        with open(full_path, "rb") as f:
+            magic = f.read(2)
+        if magic != b"\x1f\x8b":
+            app.logger.error(f"[BAD FILE] fake .nii.gz detected: {full_path}")
+            abort(500, description=f"Invalid gzip NIfTI file: {filename}")
+
+    if lower.endswith(".nii"):
+        return send_file(full_path, mimetype="application/octet-stream")
+    if lower.endswith(".nii.gz"):
+        return send_file(full_path, mimetype="application/gzip")
+
+    return send_from_directory(RESULT_FOLDER, filename)
+
 
 
 @app.route('/algorithms',methods=['GET'])
 def get_algorithms():
     return jsonify([{"key":k,"label":v} for k,v in ALGORITHM_LABELS.items()])
+
+
+@app.route('/detect_view',methods=['POST'])
+@token_required
+def detect_view():
+    """
+    自动检测上传文件的视图类型（2CH / 4CH / unknown）
+    
+    请求参数:
+        - file: 上传的图像/视频文件（NIfTI, AVI, MP4, PNG, JPG等）
+        - threshold: 可选，置信度阈值（默认0.7）
+    
+    返回:
+        {
+            "view_type": "2ch" | "4ch" | "unknown",
+            "confidence": 0.95,
+            "prob_2ch": 0.05,
+            "prob_4ch": 0.95,
+            "is_reliable": true,
+            "threshold": 0.7
+        }
+    """
+    try:
+        from inference.view_classifier import CONFIDENCE_THRESHOLD
+        
+        file = request.files.get('file')
+        if not file or not file.filename:
+            return jsonify({"error":"请提供文件"}),400
+        
+        # 获取阈值参数
+        threshold = request.form.get('threshold', CONFIDENCE_THRESHOLD)
+        try:
+            threshold = float(threshold)
+        except (ValueError, TypeError):
+            threshold = CONFIDENCE_THRESHOLD
+        
+        # 保存上传的文件
+        filename = secure_filename(file.filename)
+        temp_path = os.path.join(UPLOAD_FOLDER, f"detect_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
+        file.save(temp_path)
+        
+        try:
+            # 处理视频/DICOM等需要转换的文件
+            if _is_video(temp_path):
+                nii_path = temp_path + "_converted.nii.gz"
+                video_to_nifti(temp_path, nii_path)
+                os.remove(temp_path)  # 删除原始视频
+                temp_path = nii_path
+            elif _is_dicom(temp_path):
+                nii_path = temp_path + "_converted.nii.gz"
+                dicom_to_nifti(temp_path, nii_path)
+                os.remove(temp_path)
+                temp_path = nii_path
+            
+            # 执行视图分类
+            result = classify_view(temp_path, threshold=threshold)
+            
+            # 添加文件信息
+            result['filename'] = filename
+            result['file_size'] = os.path.getsize(temp_path)
+            
+            return jsonify(result)
+            
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                    
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error":str(e)}),500
+
+
+@app.route('/detect_view_batch',methods=['POST'])
+@token_required
+def detect_view_batch():
+    """
+    批量检测视图类型（用于同时上传多个文件）
+    
+    请求参数:
+        - files: 多个上传文件
+        - auto_assign: 是否自动分配2CH/4CH（默认true）
+        - threshold: 置信度阈值
+    
+    返回:
+        {
+            "classifications": [...],
+            "assigned": {
+                "2ch": "path/to/file1",
+                "4ch": "path/to/file2"
+            },
+            "warnings": [...]
+        }
+    """
+    try:
+        files = request.files.getlist('files')
+        if not files:
+            return jsonify({"error":"请提供文件"}),400
+        
+        auto_assign = request.form.get('auto_assign', 'true').lower() == 'true'
+        threshold = float(request.form.get('threshold', 0.7))
+        
+        # 保存所有文件
+        saved_paths = []
+        timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+        
+        for i, file in enumerate(files):
+            if not file or not file.filename:
+                continue
+            filename = secure_filename(file.filename)
+            temp_path = os.path.join(UPLOAD_FOLDER, f"batch_{timestamp}_{i}_{filename}")
+            file.save(temp_path)
+            saved_paths.append((temp_path, filename))
+        
+        if not saved_paths:
+            return jsonify({"error":"没有有效文件"}),400
+        
+        try:
+            # 转换需要处理的文件
+            processed_paths = []
+            for path, orig_name in saved_paths:
+                try:
+                    if _is_video(path):
+                        nii_path = path + "_converted.nii.gz"
+                        video_to_nifti(path, nii_path)
+                        os.remove(path)
+                        processed_paths.append((nii_path, orig_name))
+                    elif _is_dicom(path):
+                        nii_path = path + "_converted.nii.gz"
+                        dicom_to_nifti(path, nii_path)
+                        os.remove(path)
+                        processed_paths.append((nii_path, orig_name))
+                    else:
+                        processed_paths.append((path, orig_name))
+                except Exception as e:
+                    print(f"[WARN] Failed to process {orig_name}: {e}")
+                    processed_paths.append((path, orig_name))
+            
+            # 批量分类
+            from inference.view_classifier import classify_views_batch
+            
+            results = []
+            for path, orig_name in processed_paths:
+                result = classify_view(path, threshold=threshold)
+                result['filename'] = orig_name
+                result['path'] = path
+                results.append(result)
+            
+            response = {
+                "classifications": results,
+                "total": len(results),
+                "reliable_count": sum(1 for r in results if r.get('is_reliable'))
+            }
+            
+            # 自动分配视图
+            if auto_assign and len(results) >= 1:
+                ch2_candidates = [r for r in results if r['view_type'] == '2ch']
+                ch4_candidates = [r for r in results if r['view_type'] == '4ch']
+                
+                # 按置信度排序
+                ch2_candidates.sort(key=lambda x: x['confidence'], reverse=True)
+                ch4_candidates.sort(key=lambda x: x['confidence'], reverse=True)
+                
+                assigned = {}
+                warnings = []
+                
+                if ch2_candidates:
+                    assigned['2ch'] = {
+                        'filename': ch2_candidates[0]['filename'],
+                        'confidence': ch2_candidates[0]['confidence']
+                    }
+                if ch4_candidates:
+                    assigned['4ch'] = {
+                        'filename': ch4_candidates[0]['filename'],
+                        'confidence': ch4_candidates[0]['confidence']
+                    }
+                
+                # 生成警告
+                if len(results) == 2:
+                    types = [r['view_type'] for r in results]
+                    if types[0] == types[1]:
+                        if types[0] == 'unknown':
+                            warnings.append("两个文件都无法被可靠识别")
+                        else:
+                            warnings.append(f"两个文件都被识别为 {types[0].upper()}")
+                
+                response['assigned'] = assigned
+                response['warnings'] = warnings
+            
+            return jsonify(response)
+            
+        finally:
+            # 清理临时文件
+            for path, _ in processed_paths:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
+                        
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error":str(e)}),500
 
 
 @app.route('/history',methods=['GET'])
@@ -1265,12 +1684,19 @@ def analyze():
     try:
         file_2ch=request.files.get('file_2ch')
         file_4ch=request.files.get('file_4ch')
-        if not file_2ch and not file_4ch:
+        
+        # 支持通用文件上传（不指定视图类型）
+        files = request.files.getlist('files')
+        
+        if not file_2ch and not file_4ch and not files:
             return jsonify({"error":"至少需要提供一个视图文件"}),400
 
         algorithm=request.form.get("algorithm","biplane_simpson")
         annulus_strategy=request.form.get("annulus_strategy","auto")
         patient_uid=request.form.get("patient_uid","").strip()
+        
+        # 是否启用自动视图检测
+        auto_detect = request.form.get("auto_detect","false").lower() == "true"
 
         age_raw=request.form.get("age","").strip()
         patient_data={
@@ -1284,16 +1710,156 @@ def analyze():
         spacing2_override=spacing4_override=None
         is_video_2ch=False
         is_video_4ch=False
+        
+        # ========== 自动视图检测模式 ==========
+        if auto_detect:
+            print("[INFO] Auto view detection enabled")
+            
+            # 收集所有上传的文件
+            all_files = []
+            print(f"[AUTO DETECT] file_2ch: {file_2ch}, filename: {file_2ch.filename if file_2ch else None}")
+            print(f"[AUTO DETECT] file_4ch: {file_4ch}, filename: {file_4ch.filename if file_4ch else None}")
+            print(f"[AUTO DETECT] files list: {len(files)} items")
+            
+            if file_2ch and file_2ch.filename:
+                all_files.append(('user_2ch', file_2ch))
+            if file_4ch and file_4ch.filename:
+                all_files.append(('user_4ch', file_4ch))
+            for f in files:
+                if f and f.filename:
+                    all_files.append(('auto', f))
+            
+            print(f"[AUTO DETECT] Total files collected: {len(all_files)}")
+            
+            if len(all_files) == 0:
+                return jsonify({"error":"没有有效文件"}),400
+            
+            # 保存所有文件
+            saved_files = []
+            timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+            
+            for label, f in all_files:
+                filename = secure_filename(f.filename)
+                prefix = f"auto_{timestamp}_"
+                temp_path = os.path.join(UPLOAD_FOLDER, prefix + filename)
+                f.save(temp_path)
+                saved_files.append((label, temp_path, filename))
+            
+            # 转换文件格式
+            converted_files = []
+            for label, path, orig_name in saved_files:
+                try:
+                    if _is_video(path):
+                        nii_path = path + "_converted.nii.gz"
+                        _, spacing = video_to_nifti(path, nii_path)
+                        os.remove(path)
+                        converted_files.append((label, nii_path, orig_name, spacing, True))
+                    elif _is_dicom(path):
+                        nii_path = path + "_converted.nii.gz"
+                        _, spacing = dicom_to_nifti(path, nii_path)
+                        os.remove(path)
+                        converted_files.append((label, nii_path, orig_name, spacing, False))
+                    else:
+                        converted_files.append((label, path, orig_name, None, False))
+                except Exception as e:
+                    print(f"[WARN] Failed to convert {orig_name}: {e}")
+                    converted_files.append((label, path, orig_name, None, False))
+            
+            # 执行自动分类
+            from inference.view_classifier import CONFIDENCE_THRESHOLD
+            threshold = float(request.form.get('threshold', CONFIDENCE_THRESHOLD))
+            
+            classifications = []
+            print(f"[AUTO DETECT] Classifying {len(converted_files)} files...")
+            for label, path, orig_name, spacing, is_video in converted_files:
+                print(f"[AUTO DETECT] Classifying: {orig_name} ({label})")
+                result = classify_view(path, threshold=threshold)
+                result['path'] = path
+                result['filename'] = orig_name
+                result['spacing'] = spacing
+                result['is_video'] = is_video
+                classifications.append(result)
+                print(f"[AUTO DETECT]   -> {result['view_class']} ({result['view_type']}) @ {result['confidence']:.2%}")
+            
+            # 分配视图
+            ch2_candidates = [c for c in classifications if c['view_type'] == '2ch']
+            ch4_candidates = [c for c in classifications if c['view_type'] == '4ch']
+            print(f"[AUTO DETECT] Found {len(ch2_candidates)} 2CH, {len(ch4_candidates)} 4CH")
+            
+            ch2_candidates.sort(key=lambda x: x['confidence'], reverse=True)
+            ch4_candidates.sort(key=lambda x: x['confidence'], reverse=True)
+            
+            auto_warnings = []
+            
+            if ch2_candidates:
+                best = ch2_candidates[0]
+                path2ch = best['path']
+                spacing2_override = best.get('spacing')
+                is_video_2ch = best.get('is_video', False)
+                print(f"[AUTO DETECT] 2CH assigned: {best['filename']} (conf: {best['confidence']:.2%})")
+            
+            if ch4_candidates:
+                best = ch4_candidates[0]
+                path4ch = best['path']
+                spacing4_override = best.get('spacing')
+                is_video_4ch = best.get('is_video', False)
+                print(f"[AUTO DETECT] 4CH assigned: {best['filename']} (conf: {best['confidence']:.2%})")
+            
+            # 检查问题
+            if not path2ch and not path4ch:
+                auto_warnings.append("无法可靠识别任何视图（2CH或4CH），请确保上传心脏超声图像")
+            elif not path2ch:
+                auto_warnings.append("未检测到2CH视图")
+            elif not path4ch:
+                auto_warnings.append("未检测到4CH视图")
+            
+            # 清理未使用的文件
+            used_paths = {path2ch, path4ch}
+            for c in classifications:
+                if c['path'] not in used_paths:
+                    try:
+                        os.remove(c['path'])
+                    except:
+                        pass
+            
+            if auto_warnings:
+                print(f"[AUTO DETECT] Warnings: {auto_warnings}")
+        
+        # ========== 传统模式（用户指定视图类型） ==========
+        else:
+            if file_2ch and file_2ch.filename:
+                path2ch,sp2,is_video_2ch=save_upload(file_2ch,UPLOAD_FOLDER,"2ch_")
+                if sp2:
+                    spacing2_override=sp2
 
-        if file_2ch and file_2ch.filename:
-            path2ch,sp2,is_video_2ch=save_upload(file_2ch,UPLOAD_FOLDER,"2ch_")
-            if sp2:
-                spacing2_override=sp2
-
-        if file_4ch and file_4ch.filename:
-            path4ch,sp4,is_video_4ch=save_upload(file_4ch,UPLOAD_FOLDER,"4ch_")
-            if sp4:
-                spacing4_override=sp4
+            if file_4ch and file_4ch.filename:
+                path4ch,sp4,is_video_4ch=save_upload(file_4ch,UPLOAD_FOLDER,"4ch_")
+                if sp4:
+                    spacing4_override=sp4
+        
+        # 检查是否有所需的视图
+        needs_2ch = algorithm in ("biplane_simpson","singleplane_2ch","area_length_2ch")
+        needs_4ch = algorithm in ("biplane_simpson","singleplane_4ch","area_length_4ch")
+        
+        # 自动降级：如果双平面算法缺少某个视图，自动切换到单平面
+        if algorithm == "biplane_simpson":
+            if path2ch and not path4ch:
+                algorithm = "singleplane_2ch"
+                auto_warnings.append("未检测到4CH视图，自动切换为单平面(2CH)算法")
+                print(f"[AUTO SWITCH] biplane_simpson -> singleplane_2ch (缺少4CH)")
+            elif path4ch and not path2ch:
+                algorithm = "singleplane_4ch"
+                auto_warnings.append("未检测到2CH视图，自动切换为单平面(4CH)算法")
+                print(f"[AUTO SWITCH] biplane_simpson -> singleplane_4ch (缺少2CH)")
+        
+        # 检查必需的视图是否存在
+        needs_2ch = algorithm in ("biplane_simpson","singleplane_2ch","area_length_2ch")
+        needs_4ch = algorithm in ("biplane_simpson","singleplane_4ch","area_length_4ch")
+        
+        if needs_2ch and not path2ch:
+            return jsonify({"error":f"算法 [{algorithm}] 需要 2CH 文件"}),400
+        if needs_4ch and not path4ch:
+            return jsonify({"error":f"算法 [{algorithm}] 需要 4CH 文件"}),400
 
         return Response(
             generate_ndjson_response(

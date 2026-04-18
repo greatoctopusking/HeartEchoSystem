@@ -1,12 +1,13 @@
 MYSQL_HOST="localhost"
 MYSQL_USER="root"
-MYSQL_PASSWORD="556904452"
+#MYSQL_PASSWORD="hch13579"
+MYSQL_PASSWORD="123456"
 MYSQL_DB="heart_echo"
 
 UPLOAD_FOLDER="uploads"
 RESULT_FOLDER="results"
 
-SECRET_KEY="your_secret_key"
+SECRET_KEY="HeartEchoSystem_JWT_Secret_Key_2024_32Bytes_Long"
 
 #nnUNet双模型配置
 #2CH数据集

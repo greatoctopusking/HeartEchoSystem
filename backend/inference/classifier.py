@@ -117,20 +117,6 @@ def load_model(
     
     missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
     
-    # [DEBUG] 打印权重加载信息
-    if missing:
-        print(f"[WARN] 缺少的权重键 ({len(missing)} 个): {missing[:5]}...")
-    if unexpected:
-        print(f"[WARN] 意外的权重键 ({len(unexpected)} 个): {unexpected[:5]}...")
-    if not missing and not unexpected:
-        print(f"[INFO] 模型权重加载成功，所有键匹配")
-    
-    # [DEBUG] 验证 backbone 是否有有效权重（非零）
-    backbone_weight_sum = sum(p.sum().item() for p in backbone.parameters())
-    print(f"[DEBUG] Backbone 权重总和: {backbone_weight_sum:.4f}")
-    if abs(backbone_weight_sum) < 0.001:
-        print(f"[WARN] ⚠️ Backbone 权重可能未正确加载（值接近0）！")
-    
     model = model.to(device)
     model.eval()
     

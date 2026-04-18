@@ -20,7 +20,7 @@ except Exception:
 
 #算法标签（供前后端共用）
 ALGORITHM_LABELS={
-    "biplane_simpson": "双平面辛普森 (2CH + 4CH)  [金标准]",
+    "biplane_simpson": "双平面辛普森 (2CH + 4CH)",
     "singleplane_2ch": "单平面辛普森 — 2CH only",
     "singleplane_4ch": "单平面辛普森 — 4CH only",
     "area_length_2ch": "面积-长度法  — 2CH only",
@@ -542,6 +542,14 @@ class BiplaneSimpsonClinical:
         """
         num_theta=32
         n_discs=len(bounds_2ch)
+        
+        # 安全检查：确保bounds长度一致
+        if len(bounds_4ch) != n_discs:
+            print(f"[WARN] bounds length mismatch: bounds_2ch={n_discs}, bounds_4ch={len(bounds_4ch)}")
+            # 使用较短的长度
+            n_discs = min(n_discs, len(bounds_4ch))
+            if n_discs == 0:
+                return np.zeros((1, 3)), []  # 返回空网格
 
         def to3(v):
             v=np.asarray(v,dtype=float).reshape(-1)
@@ -564,8 +572,24 @@ class BiplaneSimpsonClinical:
         vertices=[]
         for i in range(n_discs):
             z_loc=i*h
-            x_min,x_max=bounds_4ch[i]
-            y_min,y_max=bounds_2ch[i]
+            # 安全检查：确保索引有效
+            if i >= len(bounds_4ch) or i >= len(bounds_2ch):
+                continue
+            try:
+                x_min,x_max=bounds_4ch[i]
+                y_min,y_max=bounds_2ch[i]
+            except (ValueError, IndexError, TypeError) as e:
+                print(f"[WARN] Invalid bounds at i={i}: {e}")
+                continue
+            
+            # 确保值为数值类型
+            try:
+                x_min, x_max = float(x_min), float(x_max)
+                y_min, y_max = float(y_min), float(y_max)
+            except (TypeError, ValueError) as e:
+                print(f"[WARN] Non-numeric bounds at i={i}: {e}")
+                continue
+            
             cx,rx=(x_max + x_min)/2.0,max(0.0,(x_max - x_min)/2.0)
             cy,ry=(y_max + y_min)/2.0,max(0.0,(y_max - y_min)/2.0)
 
@@ -579,6 +603,19 @@ class BiplaneSimpsonClinical:
                     vertices.append([vx,vy,z_loc])
 
         vertices=np.array(vertices,dtype=np.float32)
+        
+        # 安全检查：确保有足够的顶点
+        if vertices.size == 0:
+            print("[WARN] No vertices generated, returning empty mesh")
+            return np.zeros((1, 3)), []
+        
+        expected_vertices = n_discs * num_theta
+        if vertices.shape[0] < expected_vertices:
+            print(f"[WARN] Vertex count mismatch: got {vertices.shape[0]}, expected {expected_vertices}")
+            # 调整 n_discs 以匹配实际顶点数
+            n_discs = vertices.shape[0] // num_theta
+            if n_discs == 0:
+                return np.zeros((1, 3)), []
 
         #侧壁面片
         faces=[]

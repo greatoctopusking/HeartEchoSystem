@@ -1,4 +1,5 @@
 import os
+import sys
 import numpy as np
 import nibabel as nib
 import torch
@@ -6,8 +7,12 @@ import onnxruntime as ort
 from scipy.ndimage import label
 from config import RESULT_FOLDER  
 import math
-CURRENT_DIR=os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT=os.path.dirname(CURRENT_DIR)
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+
+# 添加 models 目录到 Python 路径
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "models"))
 
 ONNX_PATHS={
     "2ch":os.path.join(PROJECT_ROOT,"models","nnUNet_results","echo_seg_2ch_fast.onnx"),
